@@ -12,16 +12,37 @@ jobs:
       fail-fast: false
       matrix:
         cc: [gcc, clang]
-        build: [debug, release]
+        buildtype: [Debug, Release]
+    env:
+      CC: ${{ matrix.cc }}
     steps:
       - uses: actions/checkout@v7
-      - run: make CC=${{ matrix.cc }} BUILD=${{ matrix.build }} V=1
-      - run: make test CC=${{ matrix.cc }} BUILD=${{ matrix.build }} V=1
-      - run: make run CC=${{ matrix.cc }} BUILD=${{ matrix.build }} ARGS="ci"
+        with:
+          submodules: recursive
+      - name: configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.buildtype }}
+      - name: build
+        run: cmake --build build
+      - name: test
+        run: ctest --test-dir build --output-on-failure
+      - name: smoke test
+        run: |
+          ./build/c-http -p 8080 -b localhost &
+          SERVER_PID=$!
+          sleep 1
+          printf 'ci\n' | timeout 5 bash -c \
+            'exec 3<>/dev/tcp/127.0.0.1/8080; cat >&3; timeout 2 cat <&3'
+          kill $SERVER_PID
 
   format:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - run: sudo apt-get update -q && sudo apt-get install -y -q clang-format
-      - run: make format-check
+        with:
+          submodules: recursive
+      - name: install clang-format
+        run: sudo apt-get update -q && sudo apt-get install -y -q clang-format
+      - name: configure
+        run: cmake -S . -B build
+      - name: check formatting
+        run: cmake --build build -t format-check

@@ -5,7 +5,7 @@ BasedOnStyle: LLVM
 IndentWidth: 4
 TabWidth: 4
 UseTab: Never
-ColumnLimit: 100
+ColumnLimit: 80
 
 BreakBeforeBraces: Linux
 AllowShortFunctionsOnASingleLine: None
@@ -20,11 +20,11 @@ AlignConsecutiveMacros: Consecutive
 AlignTrailingComments: true
 AlignEscapedNewlines: Left
 
-SortIncludes: CaseSensitive
+IgnoreCase: false
 IncludeBlocks: Regroup
 IncludeCategories:
-  - Regex: '^<.*>'
-    Priority: 1
-  - Regex: '^".*"'
-    Priority: 2
+    - Regex: "^<.*>"
+      Priority: 1
+    - Regex: '^".*"'
+      Priority: 2
 ...

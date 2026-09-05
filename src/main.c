@@ -1,10 +1,60 @@
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include "args.h"
+#include "http.h"
+
+static const char body[] = "<html><body><h1>Hello World</h1></body></html>";
+
+static void home_handler(const HttpRequest *req, HttpResponse *res)
+{
+    (void)req;
+    res->status = 200;
+    memcpy(res->body, body, sizeof(body) - 1);
+    res->body_len = sizeof(body) - 1;
+}
 
 int main(int argc, char **argv)
 {
-    printf("hello, world\n");
-    for (int i = 1; i < argc; i++) {
-        printf("arg[%d] = %s\n", i, argv[i]);
+    signal(SIGCHLD, SIG_IGN);
+
+    Args args;
+    switch(parse_args(argc, argv, &args)) {
+        case ARGS_OK:
+            break;
+        case ARGS_HELP:
+            return 0;
+        case ARGS_ERROR:
+            return 1;
     }
+
+    ServerArgs server_args = {
+        .bind_addr = args.bind_addr,
+        .port = args.port,
+    };
+
+    HttpServer server;
+    if(http_create_server(&server_args, &server) == SERVER_ERROR) {
+        fprintf(stderr, "failed to create server\n");
+        return 1;
+    }
+
+
+    if(http_get(&server, "/", home_handler) == SERVER_ERROR) {
+        fprintf(stderr, "failed to register routes\n");
+        http_close_server(&server);
+        return 1;
+    }
+
+    http_listen(&server);
+
+    http_close_server(&server);
+    printf("Server stopped\n");
     return 0;
 }
