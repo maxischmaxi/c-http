@@ -20,7 +20,7 @@ AlignConsecutiveMacros: Consecutive
 AlignTrailingComments: true
 AlignEscapedNewlines: Left
 
-IgnoreCase: false
+SortIncludes: CaseSensitive
 IncludeBlocks: Regroup
 IncludeCategories:
     - Regex: "^<.*>"

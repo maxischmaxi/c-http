@@ -20,18 +20,35 @@ static void home_handler(const HttpRequest *req, HttpResponse *res)
     res->body_len = sizeof(body) - 1;
 }
 
+static void home_post_handler(const HttpRequest *req, HttpResponse *res)
+{
+    (void)req;
+    res->status = 200;
+    memcpy(res->body, body, sizeof(body) - 1);
+    res->body_len = sizeof(body) - 1;
+}
+
+static void cors_middleware(const HttpRequest *req, HttpResponse *res)
+{
+    (void)req;
+    (void)res;
+    // res->status = 200;
+    // memcpy(res->body, body, sizeof(body) - 1);
+    // res->body_len = sizeof(body) - 1;
+}
+
 int main(int argc, char **argv)
 {
     signal(SIGCHLD, SIG_IGN);
 
     Args args;
-    switch(parse_args(argc, argv, &args)) {
-        case ARGS_OK:
-            break;
-        case ARGS_HELP:
-            return 0;
-        case ARGS_ERROR:
-            return 1;
+    switch (parse_args(argc, argv, &args)) {
+    case ARGS_OK:
+        break;
+    case ARGS_HELP:
+        return 0;
+    case ARGS_ERROR:
+        return 1;
     }
 
     ServerArgs server_args = {
@@ -40,14 +57,26 @@ int main(int argc, char **argv)
     };
 
     HttpServer server;
-    if(http_create_server(&server_args, &server) == SERVER_ERROR) {
+    if (http_create_server(&server_args, &server) == SERVER_ERROR) {
         fprintf(stderr, "failed to create server\n");
         return 1;
     }
 
+    if (http_middleware(&server, NULL, cors_middleware) !=
+        HTTP_MIDDLEWARE_ADD_OK) {
+        fprintf(stderr, "failed to register middleware\n");
+        http_close_server(&server);
+        return 1;
+    }
 
-    if(http_get(&server, "/", home_handler) == SERVER_ERROR) {
+    if (http_get(&server, "/", home_handler) != HTTP_ROUTE_ADD_OK) {
         fprintf(stderr, "failed to register routes\n");
+        http_close_server(&server);
+        return 1;
+    }
+
+    if (http_post(&server, "/", home_post_handler) != HTTP_ROUTE_ADD_OK) {
+        fprintf(stderr, "failed to register post handler for home route\n");
         http_close_server(&server);
         return 1;
     }
