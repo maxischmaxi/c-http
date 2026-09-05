@@ -1,0 +1,17 @@
+# build output
+/build/
+compile_commands.json
+.cache/
+
+# debug artifacts
+core
+core.*
+vgcore.*
+*.dSYM/
+
+# editors
+*.swp
+*.swo
+*~
+.vscode/
+.idea/

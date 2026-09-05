@@ -1,0 +1,27 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+        build: [debug, release]
+    steps:
+      - uses: actions/checkout@v7
+      - run: make CC=${{ matrix.cc }} BUILD=${{ matrix.build }} V=1
+      - run: make test CC=${{ matrix.cc }} BUILD=${{ matrix.build }} V=1
+      - run: make run CC=${{ matrix.cc }} BUILD=${{ matrix.build }} ARGS="ci"
+
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update -q && sudo apt-get install -y -q clang-format
+      - run: make format-check
