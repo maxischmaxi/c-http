@@ -1,0 +1,38 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q zlib1g-dev python3
+
+      - name: generate single-header amalgamation
+        run: python3 scripts/amalgamate.py --output c_http_single.h
+
+      - name: verify single-header compiles
+        run: |
+          cat > /tmp/test.c << 'EOF'
+          #define C_HTTP_IMPLEMENTATION
+          #include "c_http_single.h"
+          int main(void) { return 0; }
+          EOF
+          cc -DNDEBUG -O2 -I. /tmp/test.c -lz -o /tmp/test && /tmp/test
+
+      - name: create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: c_http_single.h
+          generate_release_notes: true
+          draft: false

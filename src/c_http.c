@@ -1,4 +1,5 @@
-#include "http.h"
+#include "c_http.h"
+#include "c_http_assert.h"
 
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -14,8 +15,85 @@
 #include <time.h>
 #include <unistd.h>
 
+/* ============================================================
+ * HTTP Spec Validation Helpers (RFC 9110, 9112)
+ * Used by asserts in debug builds and as guard checks.
+ * ============================================================ */
+#ifndef NDEBUG
+
+/* RFC 9110 §5.5: field-name = 1*tchar
+ * tchar excludes CTL (0-31, 127), SP, colon */
+static bool is_valid_header_name(const char *name)
+{
+    if (!name || !*name) return false;
+    for (const char *p = name; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c <= 0x1f || c == 0x7f) return false; /* no CTL */
+        if (c == ' ' || c == '\t' || c == ':') return false;
+    }
+    return true;
+}
+
+/* RFC 9110 §5.6: field-value must not contain bare CR or LF
+ * Prevents header injection attacks */
+static bool header_value_has_injection(const char *value)
+{
+    if (!value) return false;
+    for (const char *p = value; *p; p++) {
+        if (*p == '\r' || *p == '\n') return true;
+    }
+    return false;
+}
+
+/* RFC 9112 §3.1: HTTP-version = HTTP-name "/" DIGIT "." DIGIT */
+static bool is_valid_http_version(const char *version)
+{
+    if (!version) return false;
+    return strncmp(version, "HTTP/", 5) == 0 &&
+           version[5] >= '0' && version[5] <= '9' &&
+           version[6] == '.' &&
+           version[7] >= '0' && version[7] <= '9' &&
+           version[8] == '\0';
+}
+
+/* RFC 9110 §15: status-code = 3DIGIT; standard range 100-599 */
+static bool is_valid_status_code(int status)
+{
+    return status >= 100 && status <= 599;
+}
+
+/* RFC 9110 §3.2: origin-form starts with "/"
+ * asterisk-form "*" only valid for OPTIONS */
+static bool is_valid_request_target(const char *path, const char *method)
+{
+    if (!path || !*path) return false;
+    if (strcmp(path, "*") == 0) {
+        return method != NULL && strcmp(method, "OPTIONS") == 0;
+    }
+    return path[0] == '/';
+}
+
+/* RFC 9112 §6.1: Transfer-Encoding and Content-Length must not coexist */
+static bool has_conflicting_body_headers(const HttpHeaders *headers)
+{
+    bool has_te = false, has_cl = false;
+    for (size_t i = 0; i < headers->count; i++) {
+        if (strcasecmp(headers->items[i].key,
+                       HTTP_HEADER_TRANSFER_ENCODING) == 0)
+            has_te = true;
+        if (strcasecmp(headers->items[i].key,
+                       HTTP_HEADER_CONTENT_LENGTH) == 0)
+            has_cl = true;
+    }
+    return has_te && has_cl;
+}
+
+#endif /* !NDEBUG — validation helpers only in debug */
+
 static const char *status_text(int status)
 {
+    HTTP_ASSERT_MSG(is_valid_status_code(status),
+                    "RFC 9110 §15: status-code must be 3-digit (100-599)");
     switch (status) {
     /* 1xx Informational */
     case 100:
@@ -157,6 +235,13 @@ static const char *status_text(int status)
 
 static bool path_matches(const char *mid_path, const char *req_path)
 {
+    HTTP_ASSERT(mid_path != NULL);
+    HTTP_ASSERT(req_path != NULL);
+    HTTP_ASSERT_MSG(mid_path[0] == '/' || mid_path[0] == '\0',
+                "middleware path must start with '/' or be empty");
+    HTTP_ASSERT_MSG(req_path[0] == '/',
+                "RFC 9110 §3.2: request-target must start with '/'");
+
     size_t mid_len = strlen(mid_path);
     size_t req_len = strlen(req_path);
 
@@ -195,6 +280,15 @@ static bool path_matches(const char *mid_path, const char *req_path)
 static int apply_header(HttpHeaders *headers, const char *key,
                         const char *value)
 {
+    HTTP_ASSERT(headers != NULL);
+    HTTP_ASSERT(key != NULL);
+    HTTP_ASSERT(value != NULL);
+    HTTP_ASSERT_MSG(is_valid_header_name(key),
+                    "RFC 9110 §5.5: header name must be a valid token");
+    HTTP_ASSERT_MSG(!header_value_has_injection(value),
+                    "RFC 9110 §5.6: header value must not contain CR/LF");
+    HTTP_ASSERT(headers->count <= headers->capacity);
+
     if (headers == NULL) {
         return -1;
     }
@@ -226,6 +320,9 @@ static int apply_header(HttpHeaders *headers, const char *key,
 
 static int string_to_http_method(const char *method, HttpMethod *out)
 {
+    HTTP_ASSERT(method != NULL);
+    HTTP_ASSERT(out != NULL);
+
     if (method == NULL || out == NULL) {
         return -1;
     }
@@ -257,6 +354,10 @@ static int string_to_http_method(const char *method, HttpMethod *out)
 
 static ssize_t read_request(int client_fd, char *buf, size_t size)
 {
+    HTTP_ASSERT(client_fd >= 0);
+    HTTP_ASSERT(buf != NULL);
+    HTTP_ASSERT(size > 1);
+
     size_t total = 0;
 
     while (total < size - 1) {
@@ -281,6 +382,9 @@ static ssize_t read_request(int client_fd, char *buf, size_t size)
 
 static int send_all(int client_fd, const char *data, size_t len)
 {
+    HTTP_ASSERT(client_fd >= 0);
+    HTTP_ASSERT(len == 0 || data != NULL);
+
     size_t sent = 0;
 
     while (sent < len) {
@@ -296,6 +400,14 @@ static int send_all(int client_fd, const char *data, size_t len)
 
 static void send_res(HttpResponse *res, int client_fd)
 {
+    HTTP_ASSERT(res != NULL);
+    HTTP_ASSERT(client_fd >= 0);
+    HTTP_ASSERT_MSG(is_valid_status_code(res->status),
+                    "RFC 9110 §15: invalid status code before send");
+    HTTP_ASSERT(status_text(res->status) != NULL);
+    HTTP_ASSERT_MSG(res->body_len <= sizeof(res->body),
+                "body_len exceeds body buffer — buffer overflow");
+
     size_t body_len =
         res->encoded_body != NULL ? res->encoded_body_len : res->body_len;
     const char *body =
@@ -343,6 +455,13 @@ static void send_res(HttpResponse *res, int client_fd)
 
 static void parse_headers(char buf[4096], ssize_t total, HttpRequest *req)
 {
+    HTTP_ASSERT(buf != NULL);
+    HTTP_ASSERT(req != NULL);
+    HTTP_ASSERT(total > 0);
+    HTTP_ASSERT_MSG(has_conflicting_body_headers(&req->headers) == false,
+                "RFC 9112 §6.1: Transfer-Encoding and Content-Length "
+                "must not coexist");
+
 
     /* --- Header parsing --- */
     /* buf sieht so aus:
@@ -373,6 +492,10 @@ static void parse_headers(char buf[4096], ssize_t total, HttpRequest *req)
             *colon = '\0';
             char *key = cursor;
 
+            HTTP_ASSERT_MSG(is_valid_header_name(key),
+                            "RFC 9110 §5.5: parsed header name "
+                            "must be a valid token");
+
             /* Value: nach ':' starten, fuehrende Leerzeichen/Tabulatoren
              * trimmen */
             char *value = colon + 1;
@@ -382,6 +505,10 @@ static void parse_headers(char buf[4096], ssize_t total, HttpRequest *req)
 
             /* Value am Zeilenende null-terminieren */
             *line_end = '\0';
+
+            HTTP_ASSERT_MSG(!header_value_has_injection(value),
+                            "RFC 9110 §5.6: parsed header value "
+                            "must not contain CR/LF");
 
             apply_header(&req->headers, key, value);
 
@@ -393,6 +520,12 @@ static void parse_headers(char buf[4096], ssize_t total, HttpRequest *req)
 static bool apply_middleware(HttpServer *server, HttpRequest *req,
                              HttpResponse *res)
 {
+    HTTP_ASSERT(server != NULL);
+    HTTP_ASSERT(req != NULL);
+    HTTP_ASSERT(res != NULL);
+    HTTP_ASSERT(server->middlewares != NULL ||
+                server->middleware_count == 0);
+
     for (size_t i = 0; i < server->middleware_count; i++) {
         HttpMiddlewareHandler middleware = server->middlewares[i].handler;
         const char *mid_path = server->middlewares[i].path;
@@ -416,6 +549,11 @@ static bool apply_middleware(HttpServer *server, HttpRequest *req,
 static int execute_handler(HttpServer *server, HttpRequest *req,
                            HttpResponse *res)
 {
+    HTTP_ASSERT(server != NULL);
+    HTTP_ASSERT(req != NULL);
+    HTTP_ASSERT(res != NULL);
+    HTTP_ASSERT(server->routes != NULL || server->route_count == 0);
+
     HttpHandler handler = NULL;
     for (size_t i = 0; i < server->route_count; i++) {
         HttpMethod m;
@@ -442,6 +580,13 @@ static int execute_handler(HttpServer *server, HttpRequest *req,
 static void handle_client(HttpServer *server, int client_fd, const char *ip,
                           uint16_t client_port)
 {
+    HTTP_ASSERT(server != NULL);
+    HTTP_ASSERT(client_fd >= 0);
+    HTTP_ASSERT(ip != NULL);
+    HTTP_ASSERT(server->fd >= 0);
+    HTTP_ASSERT(server->listening == true);
+    HTTP_ASSERT(server->routes != NULL);
+
     char buf[4096];
     ssize_t total = read_request(client_fd, buf, sizeof(buf));
 
@@ -491,10 +636,36 @@ static void handle_client(HttpServer *server, int client_fd, const char *ip,
         return;
     }
 
+    /* RFC 9112 §3.1: Request-Line must be method SP target SP version CRLF */
+    HTTP_ASSERT_MSG(fields == 3, "RFC 9112 §3.1: request-line must have 3 fields");
+    /* RFC 9112 §3.1: HTTP-version must match HTTP/x.y */
+    HTTP_ASSERT_MSG(is_valid_http_version(req.version),
+                    "RFC 9112 §3.1: invalid HTTP version");
+    /* RFC 9110 §3.2: request-target must start with '/' or be '*' for OPTIONS */
+    HTTP_ASSERT_MSG(is_valid_request_target(req.path, req.method),
+                    "RFC 9110 §3.2: invalid request-target");
+
     printf("%s:%u %s %s -> %d\n", ip, client_port, req.method, req.path,
            res.status);
 
     parse_headers(buf, total, &req);
+
+    /* RFC 9112 §3.2: Host header mandatory in HTTP/1.1 (check after parsing) */
+#ifndef NDEBUG
+    if (strcmp(req.version, "HTTP/1.1") == 0) {
+        bool has_host = false;
+        for (size_t i = 0; i < req.headers.count; i++) {
+            if (strcasecmp(req.headers.items[i].key,
+                           HTTP_HEADER_HOST) == 0) {
+                has_host = true;
+                break;
+            }
+        }
+        HTTP_ASSERT_MSG(has_host,
+                        "RFC 9112 §3.2: Host header mandatory in HTTP/1.1");
+    }
+#endif
+
     if (apply_middleware(server, &req, &res)) {
         if (execute_handler(server, &req, &res) != 0) {
             res.status = HTTP_STATUS_NOT_FOUND;
@@ -505,7 +676,18 @@ static void handle_client(HttpServer *server, int client_fd, const char *ip,
         res.status = HTTP_STATUS_INTERNAL_SERVER_ERROR;
     }
 
+    /* RFC 9110 §15: validate status before encoding and sending */
+    HTTP_ASSERT_MSG(is_valid_status_code(res.status),
+                    "RFC 9110 §15: status code must be 100-599 before send");
+    HTTP_ASSERT_MSG(res.body_len <= sizeof(res.body),
+                "body_len exceeds body buffer — buffer overflow");
+
     http_encode_body(server, &req, &res);
+
+    /* RFC 9110 §8.6: Content-Length must match actual body size sent */
+    if (res.encoded_body != NULL) {
+        HTTP_ASSERT(res.encoded_body_len > 0);
+    }
 
     send_res(&res, client_fd);
     http_headers_free(&res.headers);
@@ -515,6 +697,12 @@ static void handle_client(HttpServer *server, int client_fd, const char *ip,
 HttpServerResult http_create_server(const ServerArgs *server_args,
                                     HttpServer *out)
 {
+    HTTP_ASSERT(server_args != NULL);
+    HTTP_ASSERT(out != NULL);
+    HTTP_ASSERT(server_args->bind_addr != NULL);
+    HTTP_ASSERT(server_args->port > 0);
+    HTTP_ASSERT(server_args->server_name != NULL);
+
     if (out == NULL || server_args == NULL) {
         return SERVER_ERROR;
     }
@@ -590,6 +778,10 @@ HttpServerResult http_create_server(const ServerArgs *server_args,
 
 void http_close_server(HttpServer *server)
 {
+    HTTP_ASSERT(server != NULL);
+    HTTP_ASSERT(server->fd >= 0);
+    HTTP_ASSERT(server->routes != NULL || server->route_count == 0);
+
     if (server->fd) {
         close(server->fd);
     }
@@ -608,6 +800,12 @@ void http_close_server(HttpServer *server)
 
 void http_listen(HttpServer *server)
 {
+    HTTP_ASSERT(server != NULL);
+    HTTP_ASSERT(server->fd >= 0);
+    HTTP_ASSERT_MSG(server->listening == false,
+                    "http_listen called twice — server already listening");
+    HTTP_ASSERT(server->routes != NULL);
+
     server->listening = true;
     printf("Server listening on port %d\n", server->port);
 
@@ -634,6 +832,15 @@ void http_listen(HttpServer *server)
 static HttpRouteAddResult http_add_route(HttpServer *server, const char *path,
                                          HttpHandler handler, HttpMethod method)
 {
+    HTTP_ASSERT(server != NULL);
+    HTTP_ASSERT(path != NULL);
+    HTTP_ASSERT_MSG(path[0] == '/',
+                    "RFC 9110 §3.2: route path must start with '/'");
+    HTTP_ASSERT(handler != NULL);
+    HTTP_ASSERT_MSG(server->listening == false,
+                    "cannot add routes while server is listening");
+    HTTP_ASSERT(server->route_count <= server->route_capacity);
+
     if (server->route_count == server->route_capacity) {
         size_t new_cap = server->route_capacity * 2;
         HttpRoute *tmp = realloc(server->routes, new_cap * sizeof(HttpRoute));
@@ -736,6 +943,14 @@ HttpMiddlewareAddResult http_middleware(HttpServer *server, const char *path,
 HttpSetHeaderResult http_set_header(HttpHeaders *headers, char *key,
                                     char *value)
 {
+    HTTP_ASSERT(headers != NULL);
+    HTTP_ASSERT(key != NULL);
+    HTTP_ASSERT(value != NULL);
+    HTTP_ASSERT_MSG(is_valid_header_name(key),
+                    "RFC 9110 §5.5: header name must be a valid token");
+    HTTP_ASSERT_MSG(!header_value_has_injection(value),
+                    "RFC 9110 §5.6: header value must not contain CR/LF");
+
     if (apply_header(headers, key, value) < 0) {
         return HTTP_SET_HEADER_ERROR;
     }

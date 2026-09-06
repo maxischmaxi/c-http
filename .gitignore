@@ -1,7 +1,11 @@
 # build output
 /build/
+/build-release/
 compile_commands.json
 .cache/
+
+# amalgamation output (generated, not committed)
+c_http_single.h
 
 # debug artifacts
 core

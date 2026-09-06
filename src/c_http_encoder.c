@@ -3,13 +3,18 @@
 #include <strings.h>
 #include <zlib.h>
 
-#include "http.h"
+#include "c_http.h"
+#include "c_http_assert.h"
 
 /* --- gzip encoder --- */
 
 static int gzip_encode(const char *in, size_t in_len, char **out,
                        size_t *out_len)
 {
+    HTTP_ASSERT(in != NULL || in_len == 0);
+    HTTP_ASSERT(out != NULL);
+    HTTP_ASSERT(out_len != NULL);
+
     z_stream strm = {0};
 
     if (deflateInit2(&strm, Z_DEFAULT_COMPRESSION, Z_DEFLATED, MAX_WBITS + 16,
@@ -38,6 +43,8 @@ static int gzip_encode(const char *in, size_t in_len, char **out,
     *out = buf;
     *out_len = strm.total_out;
     deflateEnd(&strm);
+    HTTP_ASSERT(*out != NULL);
+    HTTP_ASSERT(*out_len > 0);
     return 0;
 }
 
@@ -51,6 +58,10 @@ const HttpEncoder http_gzip_encoder = {
 static int identity_encode(const char *in, size_t in_len, char **out,
                            size_t *out_len)
 {
+    HTTP_ASSERT(in != NULL || in_len == 0);
+    HTTP_ASSERT(out != NULL);
+    HTTP_ASSERT(out_len != NULL);
+
     char *buf = malloc(in_len == 0 ? 1 : in_len);
     if (!buf) {
         return -1;
@@ -71,6 +82,13 @@ const HttpEncoder http_identity_encoder = {
 HttpEncoderAddResult http_register_encoder(HttpServer *server,
                                            HttpEncoder encoder)
 {
+    HTTP_ASSERT(server != NULL);
+    HTTP_ASSERT(encoder.name != NULL);
+    HTTP_ASSERT(encoder.encode != NULL);
+    HTTP_ASSERT_MSG(server->listening == false,
+                    "cannot register encoder while server is listening");
+    HTTP_ASSERT(server->encoder_count <= server->encoder_capacity);
+
     if (server->encoder_count == server->encoder_capacity) {
         size_t new_cap =
             server->encoder_capacity == 0 ? 4 : server->encoder_capacity * 2;
@@ -91,6 +109,7 @@ HttpEncoderAddResult http_register_encoder(HttpServer *server,
 
 void http_headers_free(HttpHeaders *headers)
 {
+    HTTP_ASSERT(headers != NULL || 1); /* NULL is valid — no-op */
     if (headers == NULL) {
         return;
     }
@@ -107,6 +126,10 @@ void http_headers_free(HttpHeaders *headers)
 
 bool http_accepts_encoding(const HttpRequest *req, const char *encoding)
 {
+    HTTP_ASSERT(req != NULL);
+    HTTP_ASSERT(encoding != NULL);
+    HTTP_ASSERT(*encoding != '\0');
+
     for (size_t i = 0; i < req->headers.count; i++) {
         if (strcasecmp(req->headers.items[i].key,
                        HTTP_HEADER_ACCEPT_ENCODING) != 0) {
@@ -153,6 +176,14 @@ bool http_accepts_encoding(const HttpRequest *req, const char *encoding)
 bool http_encode_body(HttpServer *server, const HttpRequest *req,
                       HttpResponse *res)
 {
+    HTTP_ASSERT(server != NULL);
+    HTTP_ASSERT(req != NULL);
+    HTTP_ASSERT(res != NULL);
+    HTTP_ASSERT_MSG(res->body_len <= sizeof(res->body),
+                "body_len exceeds body buffer");
+    HTTP_ASSERT(server->encoders != NULL ||
+                server->encoder_count == 0);
+
     if (res->body_len == 0 || res->encoded_body != NULL) {
         return false;
     }

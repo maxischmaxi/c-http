@@ -1,4 +1,5 @@
 #include "args.h"
+#include "c_http_assert.h"
 
 #include <cargs.h>
 #include <errno.h>
@@ -31,6 +32,7 @@ static struct cag_option options[] = {
 
 static uint16_t parse_port(const char *val)
 {
+    HTTP_ASSERT(val != NULL);
     char *end = NULL;
     errno = 0;
     long parsed = strtol(val, &end, 10);
@@ -45,6 +47,10 @@ static uint16_t parse_port(const char *val)
 
 ArgsResult parse_args(int argc, char **argv, Args *out)
 {
+    HTTP_ASSERT(argc >= 1);
+    HTTP_ASSERT(argv != NULL);
+    HTTP_ASSERT(out != NULL);
+
     Args args = {
         .port = 80,
         .bind_addr = "0.0.0.0",

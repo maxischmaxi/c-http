@@ -19,6 +19,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
+      - name: install zlib
+        run: sudo apt-get update -q && sudo apt-get install -y -q zlib1g-dev
       - name: configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.buildtype }}
       - name: build
@@ -27,12 +29,28 @@ jobs:
         run: ctest --test-dir build --output-on-failure
       - name: smoke test
         run: |
-          ./build/c-http -p 8080 -b localhost &
+          ./build/c-http-example -p 8080 -b localhost &
           SERVER_PID=$!
           sleep 1
-          printf 'ci\n' | timeout 5 bash -c \
-            'exec 3<>/dev/tcp/127.0.0.1/8080; cat >&3; timeout 2 cat <&3'
+          curl -sf -o /dev/null http://127.0.0.1:8080/
           kill $SERVER_PID
+
+  amalgamate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: install zlib + python3
+        run: sudo apt-get update -q && sudo apt-get install -y -q zlib1g-dev python3
+      - name: generate single-header
+        run: python3 scripts/amalgamate.py --output c_http_single.h
+      - name: verify single-header compiles
+        run: |
+          cat > /tmp/test.c << 'EOF'
+          #define C_HTTP_IMPLEMENTATION
+          #include "c_http_single.h"
+          int main(void) { return 0; }
+          EOF
+          cc -DNDEBUG -O2 -I. /tmp/test.c -lz -o /tmp/test && /tmp/test
 
   format:
     runs-on: ubuntu-latest

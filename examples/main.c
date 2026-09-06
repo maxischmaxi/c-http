@@ -8,7 +8,8 @@
 #include <unistd.h>
 
 #include "args.h"
-#include "http.h"
+#include "c_http.h"
+#include "c_http_assert.h"
 
 static const char body[] = "<html><body><h1>Hello World</h1></body></html>";
 
@@ -64,6 +65,10 @@ int main(int argc, char **argv)
         fprintf(stderr, "failed to create server\n");
         return 1;
     }
+
+    HTTP_ASSERT(server.fd >= 0);
+    HTTP_ASSERT(server.routes != NULL);
+    HTTP_ASSERT(server.encoder_count >= 2);
 
     http_register_encoder(&server, http_gzip_encoder);
 
