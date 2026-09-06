@@ -76,9 +76,20 @@ target_link_libraries(my-app PRIVATE c_http::c_http)
 | Middleware abort (short-circuit)     | ✅     |
 | Dynamic headers (request + response) | ✅     |
 | gzip content encoding (default)      | ✅     |
-| Custom encoder plugin system         | ✅     |
+| Request body (`Content-Length`)       | ✅     |
+| Accept-Encoding q-values (RFC 9110)   | ✅     |
+| Custom encoder plugin system          | ✅     |
+| Graceful shutdown (`http_stop_server`)| ✅     |
+| Slowloris protection (socket timeout) | ✅     |
 | HTTP spec asserts (debug builds)     | ✅     |
 | Single-header amalgamation           | ✅     |
+
+Responses follow HTTP/1.1: correct status codes (`400/405/413/414/431/501/505`
+instead of silent 404s for malformed requests), `HEAD` falls back to `GET`
+with the body suppressed, query strings are stripped from routing, request
+bodies are exposed via `req->body`, and header injection / response splitting
+is rejected in every build type. `http_stop_server()` stops a running
+`http_listen()` loop (safe to call from a `SIGINT`/`SIGTERM` handler).
 
 ## Build types
 

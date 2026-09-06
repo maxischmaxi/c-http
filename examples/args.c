@@ -65,6 +65,10 @@ ArgsResult parse_args(int argc, char **argv, Args *out)
         switch (cag_option_get_identifier(&context)) {
         case 'p': {
             const char *val = cag_option_get_value(&context);
+            if (val == NULL) {
+                fprintf(stderr, "missing value for --port\n");
+                return ARGS_ERROR;
+            }
             args.port = parse_port(val);
             if (args.port == 0) {
                 fprintf(stderr, "invalid port: %s (allowed 1-65535)\n", val);
@@ -72,9 +76,15 @@ ArgsResult parse_args(int argc, char **argv, Args *out)
             }
             break;
         }
-        case 'b':
-            args.bind_addr = cag_option_get_value(&context);
+        case 'b': {
+            const char *val = cag_option_get_value(&context);
+            if (val == NULL) {
+                fprintf(stderr, "missing value for --bind\n");
+                return ARGS_ERROR;
+            }
+            args.bind_addr = val;
             break;
+        }
         case 'v':
             args.verbose = true;
             break;

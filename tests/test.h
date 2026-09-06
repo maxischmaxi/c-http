@@ -18,6 +18,16 @@ static int test_failures = 0;
         }                                                                    \
     } while (0)
 
+#define CHECK_MSG(cond, msg)                                           \
+    do {                                                               \
+        test_checks++;                                                 \
+        if (!(cond)) {                                                 \
+            test_failures++;                                           \
+            fprintf(stderr, "%s:%d: CHECK(%s) failed: %s\n", __FILE__, \
+                    __LINE__, #cond, (msg));                           \
+        }                                                              \
+    } while (0)
+
 static inline int test_report(void)
 {
     if (test_failures) {

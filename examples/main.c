@@ -12,6 +12,17 @@
 #include "c_http.h"
 #include "c_http_assert.h"
 
+static HttpServer *g_server = NULL;
+
+/* Async-signal-safe: http_stop_server nutzt nur ein Flag + shutdown(). */
+static void on_terminate(int sig)
+{
+    (void)sig;
+    if (g_server != NULL) {
+        http_stop_server(g_server);
+    }
+}
+
 /* ---------------------------------------------------------------------------
  * Handlers
  * ------------------------------------------------------------------------- */
@@ -146,8 +157,6 @@ static HttpMiddlewareResult admin_auth_middleware(const HttpRequest *req,
 
 int main(int argc, char **argv)
 {
-    signal(SIGCHLD, SIG_IGN);
-
     Args args;
     switch (parse_args(argc, argv, &args)) {
     case ARGS_OK:
@@ -171,6 +180,14 @@ int main(int argc, char **argv)
     HTTP_ASSERT(server.fd >= 0);
     HTTP_ASSERT(server.routes != NULL);
     HTTP_ASSERT(server.encoder_count >= 2);
+
+    g_server = &server;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_terminate;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
 
     /* --- Global middleware (runs for every request) --- */
     http_middleware(&server, NULL, cors_middleware);

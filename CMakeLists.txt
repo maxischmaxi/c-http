@@ -44,6 +44,8 @@ if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
   target_compile_definitions(c_http_options INTERFACE NDEBUG)
 endif()
 
+find_package(Threads REQUIRED)
+
 function(c_http_apply_options target)
   target_link_libraries(${target} PRIVATE c_http_options)
   if(USE_SANITIZERS AND CMAKE_BUILD_TYPE STREQUAL "Debug")
@@ -120,6 +122,12 @@ if(C_HTTP_IS_TOPLEVEL AND C_HTTP_BUILD_TESTS)
   target_link_libraries(test_example PRIVATE c_http)
   c_http_apply_options(test_example)
   add_test(NAME example COMMAND test_example)
+
+  # echte Library-Tests (Integration ueber Sockets, laeuft in einem Thread)
+  add_executable(test_http tests/test_http.c)
+  target_link_libraries(test_http PRIVATE c_http Threads::Threads)
+  c_http_apply_options(test_http)
+  add_test(NAME http COMMAND test_http)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -158,4 +166,4 @@ add_custom_target(format
 add_custom_target(format-check
   COMMAND clang-format --dry-run --Werror ${C_HTTP_SOURCES})
 add_custom_target(lint
-  COMMAND clang-tidy -p ${CMAKE_BINARY_DIR} ${CMAKE_SOURCE_DIR}/src/c_http.c)
+  COMMAND clang-tidy -p ${CMAKE_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src/c_http.c)

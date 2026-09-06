@@ -9,6 +9,13 @@
 
 #define HTTP_ROUTE_INITIAL_CAP 8
 
+/* Parsing-Grenzen: Puffergrößen müssen zu diesen Werten passen. */
+#define HTTP_METHOD_MAX  8 /* längste bekannte Methode: "CONNECT" */
+#define HTTP_PATH_MAX    512
+#define HTTP_VERSION_MAX 16
+#define HTTP_MAX_HEADERS 64              /* mehr Request-Header -> 431 */
+#define HTTP_MAX_BODY    (1024u * 1024u) /* größerer Request-Body -> 413 */
+
 #define HTTP_HEADER_A_IM            "A-IM"
 #define HTTP_HEADER_ACCEPT          "Accept"
 #define HTTP_HEADER_ACCEPT_CHARSET  "Accept-Charset"
@@ -265,14 +272,18 @@ typedef struct {
 typedef struct {
     uint16_t port;
     const char *bind_addr;
-    char *server_name;
+    const char *server_name;
 } ServerArgs;
 
 typedef struct {
-    char method[8];
-    char path[512];
-    char version[16];
+    char method[HTTP_METHOD_MAX];
+    char path[HTTP_PATH_MAX];
+    char version[HTTP_VERSION_MAX];
     HttpHeaders headers;
+    /* Request-Body (NUL-terminiert; von der Library allokiert und nach dem
+     * Request wieder freigegeben). NULL wenn kein Body gesendet wurde. */
+    char *body;
+    size_t body_len;
 } HttpRequest;
 
 typedef struct {
@@ -325,6 +336,10 @@ HttpServerResult http_create_server(const ServerArgs *server_args,
                                     HttpServer *out);
 void http_close_server(HttpServer *server);
 void http_listen(HttpServer *server);
+/* Stoppt den laufenden http_listen()-Loop (async-signal-safe: darf aus einem
+ * Signal-Handler gerufen werden). Der lauschende Socket wird heruntergefahren,
+ * damit ein blockierendes accept() sofort zurückkehrt. */
+void http_stop_server(HttpServer *server);
 HttpRouteAddResult http_get(HttpServer *server, const char *path,
                             HttpHandler handler);
 HttpRouteAddResult http_post(HttpServer *server, const char *path,
@@ -369,8 +384,8 @@ HttpRouteAddResult http_group_options(HttpGroup *group, const char *path,
 HttpMiddlewareAddResult http_group_middleware(HttpGroup *group,
                                               const char *path,
                                               HttpMiddlewareHandler handler);
-HttpSetHeaderResult http_set_header(HttpHeaders *headers, char *key,
-                                    char *value);
+HttpSetHeaderResult http_set_header(HttpHeaders *headers, const char *key,
+                                    const char *value);
 
 HttpEncoderAddResult http_register_encoder(HttpServer *server,
                                            HttpEncoder encoder);

@@ -109,9 +109,8 @@ HttpEncoderAddResult http_register_encoder(HttpServer *server,
 
 void http_headers_free(HttpHeaders *headers)
 {
-    HTTP_ASSERT(headers != NULL || 1); /* NULL is valid — no-op */
     if (headers == NULL) {
-        return;
+        return; /* NULL ist erlaubt — no-op */
     }
     for (size_t i = 0; i < headers->count; i++) {
         free(headers->items[i].key);
@@ -124,11 +123,49 @@ void http_headers_free(HttpHeaders *headers)
 
 /* --- content negotiation --- */
 
+/* Parst ";q=0.5"-Parameter ab *pp (zeigt auf ';'). Liefert den q-Wert
+ * (Default 1.0 bei unparsebarem/nicht vorhandenem q) und rückt *pp bis
+ * zum nächsten ';' oder ',' vor. */
+static double parse_q(const char **pp)
+{
+    const char *p = *pp;
+    double q = 1.0;
+
+    while (*p == ';') {
+        p++; /* ';' überspringen */
+        while (*p == ' ' || *p == '\t')
+            p++;
+
+        if ((p[0] == 'q' || p[0] == 'Q') && p[1] == '=') {
+            char *end = NULL;
+            double v = strtod(p + 2, &end);
+            if (end != p + 2 && v >= 0.0)
+                q = v;
+            if (q > 1.0)
+                q = 1.0;
+        }
+
+        while (*p && *p != ';' && *p != ',')
+            p++;
+    }
+
+    *pp = p;
+    return q;
+}
+
+/* RFC 9110 §12.5.6: Accept-Encoding berücksichtigt q-Werte (q=0 =
+ * explizit verboten) und behandelt alle Accept-Encoding-Header (nicht
+ * nur den ersten). "*" matcht nur Encodings, die nicht explizit gelistet
+ * sind. */
 bool http_accepts_encoding(const HttpRequest *req, const char *encoding)
 {
-    HTTP_ASSERT(req != NULL);
-    HTTP_ASSERT(encoding != NULL);
-    HTTP_ASSERT(*encoding != '\0');
+    if (req == NULL || encoding == NULL || *encoding == '\0')
+        return false;
+
+    bool specific_found = false;
+    bool specific_ok = false;
+    bool wildcard_found = false;
+    double wildcard_q = 0.0;
 
     for (size_t i = 0; i < req->headers.count; i++) {
         if (strcasecmp(req->headers.items[i].key,
@@ -138,39 +175,52 @@ bool http_accepts_encoding(const HttpRequest *req, const char *encoding)
 
         const char *p = req->headers.items[i].value;
         while (*p) {
-            while (*p == ' ' || *p == '\t') {
+            while (*p == ' ' || *p == '\t' || *p == ',')
                 p++;
-            }
-            if (*p == '\0') {
+            if (*p == '\0')
                 break;
-            }
 
-            /* Wildcard "*" = akzeptiert alles */
-            if (*p == '*') {
-                return true;
-            }
-
-            /* Encoding-Name vergleichen */
-            size_t enc_len = strlen(encoding);
-            if (strncasecmp(p, encoding, enc_len) == 0) {
-                char next = p[enc_len];
-                if (next == ',' || next == ';' || next == '\0' || next == ' ' ||
-                    next == '\t') {
-                    return true;
-                }
-            }
-
-            /* Zum nächsten Komma springen */
-            while (*p && *p != ',') {
+            /* Coding-Name lesen (bis ',' oder ';') */
+            const char *name_start = p;
+            while (*p && *p != ',' && *p != ';')
                 p++;
+            const char *name_end = p;
+            while (name_end > name_start &&
+                   (name_end[-1] == ' ' || name_end[-1] == '\t'))
+                name_end--;
+
+            size_t name_len = (size_t)(name_end - name_start);
+            bool wildcard = (name_len == 1 && name_start[0] == '*');
+            bool match =
+                wildcard || (name_len == strlen(encoding) &&
+                             strncasecmp(name_start, encoding, name_len) == 0);
+
+            double q = 1.0;
+            if (*p == ';')
+                q = parse_q(&p);
+
+            if (wildcard) {
+                wildcard_found = true;
+                if (q > wildcard_q)
+                    wildcard_q = q;
+            } else if (match) {
+                specific_found = true;
+                if (q > 0.0)
+                    specific_ok = true; /* höchstes q gewinnt */
             }
-            if (*p == ',') {
+
+            /* Zum nächsten Listenelement springen */
+            while (*p && *p != ',')
                 p++;
-            }
+            if (*p == ',')
+                p++;
         }
-        return false;
     }
-    return false;
+
+    /* Explizite Nennung schlägt Wildcard: "gzip;q=0, *" lehnt gzip ab. */
+    if (specific_found)
+        return specific_ok;
+    return wildcard_found && wildcard_q > 0.0;
 }
 
 bool http_encode_body(HttpServer *server, const HttpRequest *req,
@@ -216,8 +266,8 @@ bool http_encode_body(HttpServer *server, const HttpRequest *req,
 
         res->encoded_body = encoded;
         res->encoded_body_len = encoded_len;
-        http_set_header(&res->headers, (char *)HTTP_HEADER_CONTENT_ENCODING,
-                        (char *)server->encoders[i].name);
+        http_set_header(&res->headers, HTTP_HEADER_CONTENT_ENCODING,
+                        server->encoders[i].name);
         return true;
     }
 

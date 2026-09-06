@@ -45,23 +45,34 @@ OUR_HEADERS = {"c_http.h", "c_http_assert.h"}
 
 
 def strip_include_guard(content):
-    """Remove #ifndef/#define/#endif include guard lines."""
+    """Remove the #ifndef/#define guard pair at the top and the LAST
+    #endif line (the guard closer).
+
+    The guard closer may carry a trailing comment ("#endif /* X_H"),
+    so a plain == "#endif" comparison would miss it — and could even
+    strip the WRONG #endif (an internal one), leaving the file
+    unbalanced. Only removing the last #endif-prefixed line is safe.
+    """
     lines = content.split("\n")
-    result = []
-    skip_endif = False
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        # Skip #ifndef / #define guard at top
-        if i == 0 and stripped.startswith("#ifndef"):
-            skip_endif = True
-            continue
-        if i == 1 and stripped.startswith("#define") and skip_endif:
-            continue
-        # Skip final #endif
-        if skip_endif and stripped == "#endif" and i >= len(lines) - 3:
-            continue
-        result.append(line)
-    return "\n".join(result)
+    if not lines or not lines[0].strip().startswith("#ifndef"):
+        return content
+
+    first = 1
+    if len(lines) > 1 and lines[1].strip().startswith("#define"):
+        first = 2
+
+    last_endif = None
+    for idx in range(len(lines) - 1, -1, -1):
+        if lines[idx].strip().startswith("#endif"):
+            last_endif = idx
+            break
+    if last_endif is None:
+        return content
+
+    return "\n".join(
+        lines[idx] for idx in range(len(lines))
+        if idx >= first and idx != last_endif
+    )
 
 
 def strip_own_includes(content):
