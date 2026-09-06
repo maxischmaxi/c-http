@@ -26,14 +26,17 @@
  * tchar excludes CTL (0-31, 127), SP, colon */
 static bool is_valid_header_name(const char *name)
 {
-    if (!name || !*name)
+    if (!name || !*name) {
         return false;
+    }
     for (const char *p = name; *p; p++) {
         unsigned char c = (unsigned char)*p;
-        if (c <= 0x1f || c == 0x7f)
+        if (c <= 0x1f || c == 0x7f) {
             return false; /* no CTL */
-        if (c == ' ' || c == '\t' || c == ':')
+        }
+        if (c == ' ' || c == '\t' || c == ':') {
             return false;
+        }
     }
     return true;
 }
@@ -42,11 +45,13 @@ static bool is_valid_header_name(const char *name)
  * Prevents header injection attacks */
 static bool header_value_has_injection(const char *value)
 {
-    if (!value)
+    if (!value) {
         return false;
+    }
     for (const char *p = value; *p; p++) {
-        if (*p == '\r' || *p == '\n')
+        if (*p == '\r' || *p == '\n') {
             return true;
+        }
     }
     return false;
 }
@@ -54,27 +59,29 @@ static bool header_value_has_injection(const char *value)
 /* RFC 9112 §3.1: HTTP-version = HTTP-name "/" DIGIT "." DIGIT */
 static bool is_valid_http_version(const char *version)
 {
-    if (!version)
+    if (!version) {
         return false;
-    return strncmp(version, "HTTP/", 5) == 0 && version[5] >= '0' &&
-           version[5] <= '9' && version[6] == '.' && version[7] >= '0' &&
-           version[7] <= '9' && version[8] == '\0';
+    }
+    return (strncmp(version, "HTTP/", 5) == 0 && version[5] >= '0' &&
+            version[5] <= '9' && version[6] == '.' && version[7] >= '0' &&
+            version[7] <= '9' && version[8] == '\0') != 0;
 }
 
 /* RFC 9110 §15: status-code = 3DIGIT; standard range 100-599 */
 static bool is_valid_status_code(int status)
 {
-    return status >= 100 && status <= 599;
+    return (status >= 100 && status <= 599) != 0;
 }
 
 /* RFC 9110 §3.2: origin-form starts with "/"
  * asterisk-form "*" only valid for OPTIONS */
 static bool is_valid_request_target(const char *path, const char *method)
 {
-    if (!path || !*path)
+    if (!path || !*path) {
         return false;
+    }
     if (strcmp(path, "*") == 0) {
-        return method != NULL && strcmp(method, "OPTIONS") == 0;
+        return (method != NULL && strcmp(method, "OPTIONS") == 0) != 0;
     }
     return path[0] == '/';
 }
@@ -85,12 +92,15 @@ static bool has_conflicting_body_headers(const HttpHeaders *headers)
     bool has_te = false, has_cl = false;
     for (size_t i = 0; i < headers->count; i++) {
         if (strcasecmp(headers->items[i].key, HTTP_HEADER_TRANSFER_ENCODING) ==
-            0)
+            0) {
             has_te = true;
-        if (strcasecmp(headers->items[i].key, HTTP_HEADER_CONTENT_LENGTH) == 0)
+        }
+        if (strcasecmp(headers->items[i].key, HTTP_HEADER_CONTENT_LENGTH) ==
+            0) {
             has_cl = true;
+        }
     }
-    return has_te && has_cl;
+    return (has_te && has_cl) != 0;
 }
 
 #endif /* !NDEBUG — validation helpers only in debug */
@@ -789,10 +799,17 @@ void http_close_server(HttpServer *server)
     if (server->fd) {
         close(server->fd);
     }
+
+    for (size_t i = 0; i < server->route_count; i++) {
+        free((void *)server->routes[i].path);
+    }
     free(server->routes);
     server->routes = NULL;
     server->route_count = server->route_capacity = 0;
 
+    for (size_t i = 0; i < server->middleware_count; i++) {
+        free((void *)server->middlewares[i].path);
+    }
     free(server->middlewares);
     server->middlewares = NULL;
     server->middleware_count = server->middleware_capacity = 0;
@@ -857,13 +874,18 @@ static HttpRouteAddResult http_add_route(HttpServer *server, const char *path,
 
     for (size_t i = 0; i < server->route_count; i++) {
         if (server->routes[i].method == method &&
-            server->routes[i].path == path) {
+            strcmp(server->routes[i].path, path) == 0) {
             return HTTP_ROUTE_ADD_CONFLICT;
         }
     }
 
+    char *owned_path = strdup(path);
+    if (!owned_path) {
+        return HTTP_ROUTE_ADD_ERROR;
+    }
+
     server->routes[server->route_count++] =
-        (HttpRoute){.path = path, .handler = handler, .method = method};
+        (HttpRoute){.path = owned_path, .handler = handler, .method = method};
 
     return HTTP_ROUTE_ADD_OK;
 }
@@ -925,6 +947,13 @@ HttpRouteAddResult http_options(HttpServer *server, const char *path,
 HttpMiddlewareAddResult http_middleware(HttpServer *server, const char *path,
                                         HttpMiddlewareHandler handler)
 {
+    HTTP_ASSERT(server != NULL);
+    HTTP_ASSERT(handler != NULL);
+    HTTP_ASSERT_MSG(path == NULL || path[0] == '/',
+                    "middleware path must start with '/' or be NULL");
+    HTTP_ASSERT_MSG(server->listening == false,
+                    "cannot add middleware while server is listening");
+
     if (server->middleware_count == server->middleware_capacity) {
         size_t new_cap = server->middleware_capacity == 0
                              ? 8
@@ -938,8 +967,16 @@ HttpMiddlewareAddResult http_middleware(HttpServer *server, const char *path,
         server->middleware_capacity = new_cap;
     }
 
+    char *owned_path = NULL;
+    if (path != NULL) {
+        owned_path = strdup(path);
+        if (!owned_path) {
+            return HTTP_MIDDLEWARE_ADD_ERROR;
+        }
+    }
+
     server->middlewares[server->middleware_count++] =
-        (HttpMiddleware){.path = path, .handler = handler};
+        (HttpMiddleware){.path = owned_path, .handler = handler};
 
     return HTTP_MIDDLEWARE_ADD_OK;
 }
@@ -959,4 +996,142 @@ HttpSetHeaderResult http_set_header(HttpHeaders *headers, char *key,
         return HTTP_SET_HEADER_ERROR;
     }
     return HTTP_SET_HEADER_OK;
+}
+
+/* ============================================================
+ * Route Groups
+ * ============================================================ */
+
+static void join_path(char *out, size_t size, const char *prefix,
+                      const char *path)
+{
+    /*
+     * "/api" + "/"      -> "/api"   (root route in group)
+     * "/api" + "/users" -> "/api/users"
+     */
+    if (strcmp(path, "/") == 0) {
+        snprintf(out, size, "%s", prefix);
+    } else {
+        snprintf(out, size, "%s%s", prefix, path);
+    }
+}
+
+HttpGroup http_group(HttpServer *server, const char *prefix)
+{
+    HTTP_ASSERT(server != NULL);
+    HTTP_ASSERT(prefix != NULL);
+    HTTP_ASSERT_MSG(prefix[0] == '/', "group prefix must start with '/'");
+    HTTP_ASSERT_MSG(server->listening == false,
+                    "cannot create group while server is listening");
+
+    return (HttpGroup){.server = server, .prefix = prefix};
+}
+
+HttpRouteAddResult http_group_get(HttpGroup *group, const char *path,
+                                  HttpHandler handler)
+{
+    HTTP_ASSERT(group != NULL);
+    HTTP_ASSERT_MSG(path[0] == '/', "group route path must start with '/'");
+    char full[1024];
+    join_path(full, sizeof(full), group->prefix, path);
+    return http_add_route(group->server, full, handler, HTTP_METHOD_GET);
+}
+
+HttpRouteAddResult http_group_post(HttpGroup *group, const char *path,
+                                   HttpHandler handler)
+{
+    HTTP_ASSERT(group != NULL);
+    HTTP_ASSERT_MSG(path[0] == '/', "group route path must start with '/'");
+    char full[1024];
+    join_path(full, sizeof(full), group->prefix, path);
+    return http_add_route(group->server, full, handler, HTTP_METHOD_POST);
+}
+
+HttpRouteAddResult http_group_patch(HttpGroup *group, const char *path,
+                                    HttpHandler handler)
+{
+    HTTP_ASSERT(group != NULL);
+    HTTP_ASSERT_MSG(path[0] == '/', "group route path must start with '/'");
+    char full[1024];
+    join_path(full, sizeof(full), group->prefix, path);
+    return http_add_route(group->server, full, handler, HTTP_METHOD_PATCH);
+}
+
+HttpRouteAddResult http_group_put(HttpGroup *group, const char *path,
+                                  HttpHandler handler)
+{
+    HTTP_ASSERT(group != NULL);
+    HTTP_ASSERT_MSG(path[0] == '/', "group route path must start with '/'");
+    char full[1024];
+    join_path(full, sizeof(full), group->prefix, path);
+    return http_add_route(group->server, full, handler, HTTP_METHOD_PUT);
+}
+
+HttpRouteAddResult http_group_delete(HttpGroup *group, const char *path,
+                                     HttpHandler handler)
+{
+    HTTP_ASSERT(group != NULL);
+    HTTP_ASSERT_MSG(path[0] == '/', "group route path must start with '/'");
+    char full[1024];
+    join_path(full, sizeof(full), group->prefix, path);
+    return http_add_route(group->server, full, handler, HTTP_METHOD_DELETE);
+}
+
+HttpRouteAddResult http_group_head(HttpGroup *group, const char *path,
+                                   HttpHandler handler)
+{
+    HTTP_ASSERT(group != NULL);
+    HTTP_ASSERT_MSG(path[0] == '/', "group route path must start with '/'");
+    char full[1024];
+    join_path(full, sizeof(full), group->prefix, path);
+    return http_add_route(group->server, full, handler, HTTP_METHOD_HEAD);
+}
+
+HttpRouteAddResult http_group_connect(HttpGroup *group, const char *path,
+                                      HttpHandler handler)
+{
+    HTTP_ASSERT(group != NULL);
+    HTTP_ASSERT_MSG(path[0] == '/', "group route path must start with '/'");
+    char full[1024];
+    join_path(full, sizeof(full), group->prefix, path);
+    return http_add_route(group->server, full, handler, HTTP_METHOD_CONNECT);
+}
+
+HttpRouteAddResult http_group_trace(HttpGroup *group, const char *path,
+                                    HttpHandler handler)
+{
+    HTTP_ASSERT(group != NULL);
+    HTTP_ASSERT_MSG(path[0] == '/', "group route path must start with '/'");
+    char full[1024];
+    join_path(full, sizeof(full), group->prefix, path);
+    return http_add_route(group->server, full, handler, HTTP_METHOD_TRACE);
+}
+
+HttpRouteAddResult http_group_options(HttpGroup *group, const char *path,
+                                      HttpHandler handler)
+{
+    HTTP_ASSERT(group != NULL);
+    HTTP_ASSERT_MSG(path[0] == '/', "group route path must start with '/'");
+    char full[1024];
+    join_path(full, sizeof(full), group->prefix, path);
+    return http_add_route(group->server, full, handler, HTTP_METHOD_OPTIONS);
+}
+
+HttpMiddlewareAddResult http_group_middleware(HttpGroup *group,
+                                              const char *path,
+                                              HttpMiddlewareHandler handler)
+{
+    HTTP_ASSERT(group != NULL);
+    HTTP_ASSERT(handler != NULL);
+
+    if (path == NULL) {
+        /* Group-scoped middleware: use group prefix as path */
+        return http_middleware(group->server, group->prefix, handler);
+    }
+
+    HTTP_ASSERT_MSG(path[0] == '/',
+                    "group middleware path must start with '/'");
+    char full[1024];
+    join_path(full, sizeof(full), group->prefix, path);
+    return http_middleware(group->server, full, handler);
 }

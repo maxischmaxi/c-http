@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define C_HTTP_VERSION "0.1.0"
+#define C_HTTP_VERSION "0.3.0"
 
 #define HTTP_ROUTE_INITIAL_CAP 8
 
@@ -316,6 +316,11 @@ typedef struct {
     char *server_name;
 } HttpServer;
 
+typedef struct {
+    HttpServer *server;
+    const char *prefix;
+} HttpGroup;
+
 HttpServerResult http_create_server(const ServerArgs *server_args,
                                     HttpServer *out);
 void http_close_server(HttpServer *server);
@@ -341,6 +346,29 @@ HttpRouteAddResult http_options(HttpServer *server, const char *path,
 
 HttpMiddlewareAddResult http_middleware(HttpServer *server, const char *path,
                                         HttpMiddlewareHandler handler);
+
+HttpGroup http_group(HttpServer *server, const char *prefix);
+HttpRouteAddResult http_group_get(HttpGroup *group, const char *path,
+                                  HttpHandler handler);
+HttpRouteAddResult http_group_post(HttpGroup *group, const char *path,
+                                   HttpHandler handler);
+HttpRouteAddResult http_group_patch(HttpGroup *group, const char *path,
+                                    HttpHandler handler);
+HttpRouteAddResult http_group_put(HttpGroup *group, const char *path,
+                                  HttpHandler handler);
+HttpRouteAddResult http_group_delete(HttpGroup *group, const char *path,
+                                     HttpHandler handler);
+HttpRouteAddResult http_group_head(HttpGroup *group, const char *path,
+                                   HttpHandler handler);
+HttpRouteAddResult http_group_connect(HttpGroup *group, const char *path,
+                                      HttpHandler handler);
+HttpRouteAddResult http_group_trace(HttpGroup *group, const char *path,
+                                    HttpHandler handler);
+HttpRouteAddResult http_group_options(HttpGroup *group, const char *path,
+                                      HttpHandler handler);
+HttpMiddlewareAddResult http_group_middleware(HttpGroup *group,
+                                              const char *path,
+                                              HttpMiddlewareHandler handler);
 HttpSetHeaderResult http_set_header(HttpHeaders *headers, char *key,
                                     char *value);
 

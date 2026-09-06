@@ -66,19 +66,19 @@ target_link_libraries(my-app PRIVATE c_http::c_http)
 
 ## Features
 
-| Feature | Status |
-|---|---|
-| HTTP/1.1 request parsing | ✅ |
-| All 9 HTTP methods | ✅ |
-| All 62 HTTP status codes | ✅ |
-| Dynamic route array | ✅ |
-| Middleware with path matching | ✅ |
-| Middleware abort (short-circuit) | ✅ |
-| Dynamic headers (request + response) | ✅ |
-| gzip content encoding (default) | ✅ |
-| Custom encoder plugin system | ✅ |
-| HTTP spec asserts (debug builds) | ✅ |
-| Single-header amalgamation | ✅ |
+| Feature                              | Status |
+| ------------------------------------ | ------ |
+| HTTP/1.1 request parsing             | ✅     |
+| All 9 HTTP methods                   | ✅     |
+| All 62 HTTP status codes             | ✅     |
+| Dynamic route array                  | ✅     |
+| Middleware with path matching        | ✅     |
+| Middleware abort (short-circuit)     | ✅     |
+| Dynamic headers (request + response) | ✅     |
+| gzip content encoding (default)      | ✅     |
+| Custom encoder plugin system         | ✅     |
+| HTTP spec asserts (debug builds)     | ✅     |
+| Single-header amalgamation           | ✅     |
 
 ## Build types
 
@@ -93,8 +93,9 @@ cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
 ## Version
 
 Defined in [`include/c_http.h`](include/c_http.h):
+
 ```c
-#define C_HTTP_VERSION "0.1.0"
+#define C_HTTP_VERSION "0.3.0"
 ```
 
 ## Project structure
@@ -122,7 +123,7 @@ ctest --test-dir build --output-on-failure  # run tests
 
 ## Dependencies
 
-| Dependency | Purpose | Required? |
-|---|---|---|
-| [zlib](https://zlib.net/) | gzip encoding | Yes |
+| Dependency                              | Purpose                  | Required?             |
+| --------------------------------------- | ------------------------ | --------------------- |
+| [zlib](https://zlib.net/)               | gzip encoding            | Yes                   |
 | [cargs](https://likle.github.io/cargs/) | CLI args (examples only) | No, only for examples |
