@@ -39,7 +39,7 @@ cc main.c -lz -o my-server && ./my-server
 ### Option 2: Git submodule
 
 ```bash
-git submodule add https://github.com/maxklein/c-http vendor/c-http
+git submodule add https://github.com/maxischmaxi/c-http vendor/c-http
 ```
 
 ```cmake
@@ -55,7 +55,7 @@ target_link_libraries(my-app PRIVATE c_http::c_http)
 ### Option 3: Install + find_package
 
 ```bash
-git clone https://github.com/maxklein/c-http && cd c-http
+git clone https://github.com/maxischmaxi/c-http && cd c-http
 cmake -S . -B build && cmake --build build && sudo cmake --install build
 ```
 

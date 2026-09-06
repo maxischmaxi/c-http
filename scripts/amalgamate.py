@@ -143,7 +143,7 @@ def main():
  *   #include "c_http_single.h"
  *
  * Requires: zlib (link with -lz)
- * Source:   https://github.com/maxklein/c-http
+ * Source:   https://github.com/maxischmaxi/c-http
  * ========================================================================== */
 
 #ifndef C_HTTP_SINGLE_H
