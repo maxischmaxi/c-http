@@ -2,6 +2,8 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <netdb.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -11,31 +13,42 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "c_http_assert.h"
+#include "c_http_static.h"
 
-/* Zeitfenster für einen Client-Request (recv UND send), danach gilt der
- * Client als tot. Schützt den single-threaded Server vor Slowloris-DoS. */
+/* Time window for a client request (recv AND send); after that the
+ * client counts as dead. Protects the single-threaded server against
+ * Slowloris DoS. */
 #define HTTP_CLIENT_TIMEOUT_SEC 10
 
-/* Backlog für listen(2) */
+/* Backlog for listen(2) */
 #define HTTP_LISTEN_BACKLOG 128
 
 #ifndef MSG_NOSIGNAL
-#define MSG_NOSIGNAL 0 /* Plattform ohne MSG_NOSIGNAL (z.B. macOS) */
+#define MSG_NOSIGNAL 0 /* platform without MSG_NOSIGNAL (e.g. macOS) */
 #endif
+
+static void free_encoded_body(HttpResponse *res)
+{
+    if (res->encoded_body != NULL) {
+        free(res->encoded_body);
+        res->encoded_body = NULL;
+    }
+}
 
 /* ============================================================
  * HTTP Spec Validation Helpers (RFC 9110, 9112)
  *
- * WICHTIG: Diese Prüfunkungen sind echte Guards und werden IMMER
- * kompiliert — auch mit NDEBUG. Sicherheitsrelevante Validierung
- * (Header-Injection, Feld-Namen) darf nicht nur in Debug-Builds
- * über HTTP_ASSERT laufen.
+ * IMPORTANT: these validation functions are real guards and are
+ * ALWAYS compiled in — even with NDEBUG. Security-relevant validation
+ * (header injection, field names) must not run only in debug builds
+ * via HTTP_ASSERT.
  * ============================================================ */
 
 /* RFC 9110 §5.5: field-name = 1*tchar */
@@ -60,7 +73,7 @@ static bool is_valid_header_name(const char *name)
     }
     for (const char *p = name; *p; p++) {
         unsigned char c = (unsigned char)*p;
-        if (c <= 0x20 || c == 0x7f || c > 0x7e) { /* kein CTL/SP, nur ASCII */
+        if (c <= 0x20 || c == 0x7f || c > 0x7e) { /* no CTL/SP, ASCII only */
             return false;
         }
         if (!is_tchar(c)) {
@@ -70,8 +83,8 @@ static bool is_valid_header_name(const char *name)
     return true;
 }
 
-/* RFC 9110 §5.6: field-value darf kein CR/LF enthalten.
- * Verhindert Header-Injection / Response-Splitting. */
+/* RFC 9110 §5.6: field-value must not contain CR/LF.
+ * Prevents header injection / response splitting. */
 static bool header_value_has_injection(const char *value)
 {
     if (value == NULL) {
@@ -104,8 +117,8 @@ static bool is_valid_status_code(int status)
 
 #ifndef NDEBUG
 
-/* RFC 9110 §3.2: origin-form startet mit "/", asterisk-form "*" nur bei
- * OPTIONS. Wird nur als Debug-Assert verwendet. */
+/* RFC 9110 §3.2: origin-form starts with "/", asterisk-form "*" only
+ * with OPTIONS. Used as a debug assert only. */
 static bool is_valid_request_target(const char *path, const char *method)
 {
     if (path == NULL || *path == '\0') {
@@ -296,9 +309,9 @@ static bool path_matches(const char *mid_path, const char *req_path)
     size_t mid_len = strlen(mid_path);
     size_t req_len = strlen(req_path);
 
-    /* Trailing Slash am Middleware-Pfad ist optional:
-     * "/api/" verhält sich wie "/api" (matcht "/api" UND "/api/users").
-     * "" matcht alles (Root). */
+    /* Trailing slash on the middleware path is optional:
+     * "/api/" behaves like "/api" (matches "/api" AND "/api/users").
+     * "" matches everything (root). */
     if (mid_len > 1 && mid_path[mid_len - 1] == '/') {
         mid_len--;
     }
@@ -318,15 +331,15 @@ static bool path_matches(const char *mid_path, const char *req_path)
     }
 
     if (mid_path[mid_len - 1] == '/') {
-        return true; /* "/" als Präfix matcht alles darunter */
+        return true; /* "/" as a prefix matches everything below */
     }
 
-    /* "/api" matcht "/api/users", aber NICHT "/api-v2" */
+    /* "/api" matches "/api/users", but NOT "/api-v2" */
     return req_path[mid_len] == '/';
 }
 
-/* Kompakte, RFC-1123-konforme Datumsangabe — bewusst NICHT über strftime,
- * weil %a/%b locale-abhängig sind (z.B. "So" statt "Sun" unter de_DE). */
+/* Compact RFC-1123-compliant date — deliberately NOT via strftime,
+ * because %a/%b are locale-dependent (e.g. "So" instead of "Sun"). */
 static void format_http_date(char *buf, size_t size)
 {
     static const char *const days[7] = {"Sun", "Mon", "Tue", "Wed",
@@ -354,8 +367,8 @@ static int apply_header(HttpHeaders *headers, const char *key,
         return -1;
     }
 
-    /* Echte Guards (auch im Release-Build): RFC-9110-Feldname und kein
-     * CR/LF im Wert (Header-Injection). */
+    /* Real guards (also in release builds): RFC 9110 field name and
+     * no CR/LF in the value (header injection). */
     if (!is_valid_header_name(key)) {
         return -1;
     }
@@ -419,9 +432,9 @@ static int string_to_http_method(const char *method, HttpMethod *out)
     return 0;
 }
 
-/* Liest den Request-Header in buf bis "\r\n\r\n" (oder bis der Puffer voll
- * ist). *complete gibt an, ob der Header-Block vollständig empfangen wurde.
- * Rückgabe: gelesene Bytes, -1 bei Fehler/Timeout. */
+/* Reads the request headers into buf up to "\r\n\r\n" (or until the
+ * buffer is full). *complete reports whether the header block was fully
+ * received. Returns the bytes read, -1 on error/timeout. */
 static ssize_t read_request(int client_fd, char *buf, size_t size,
                             bool *complete)
 {
@@ -436,21 +449,21 @@ static ssize_t read_request(int client_fd, char *buf, size_t size,
     while (total < size - 1) {
         ssize_t r = recv(client_fd, buf + total, size - 1 - total, 0);
         if (r < 0) {
-            if (errno == EINTR) { /* Signal empfangen: erneut versuchen */
+            if (errno == EINTR) { /* signal received: retry */
                 continue;
             }
-            return -1; /* Fehler oder Timeout (SO_RCVTIMEO) */
+            return -1; /* error or timeout (SO_RCVTIMEO) */
         }
         if (r == 0) {
-            break; /* Client hat die Verbindung geschlossen */
+            break; /* client closed the connection */
         }
 
         size_t chunk_start = total;
         total += (size_t)r;
         buf[total] = '\0';
 
-        /* Nur den neuen Chunk + 3 Bytes Overlap scannen, damit ein
-         * "\r\n\r\n" über die Chunk-Grenze erkannt wird (kein O(n²)). */
+        /* Scan only the new chunk + 3 bytes of overlap, so a
+         * "\r\n\r\n" across the chunk boundary is detected (no O(n²)). */
         size_t scan_from = chunk_start > 3 ? chunk_start - 3 : 0;
         if (strstr(buf + scan_from, "\r\n\r\n") != NULL) {
             *complete = true;
@@ -470,9 +483,8 @@ static int send_all(int client_fd, const char *data, size_t len)
     size_t sent = 0;
 
     while (sent < len) {
-        /* MSG_NOSIGNAL: SIGPIPE unterdrücken — ein Client, der mitten in
-         * der Response die Verbindung schließt, darf den Server nicht
-         * killen. */
+        /* MSG_NOSIGNAL: suppress SIGPIPE — a client closing the
+         * connection mid-response must not kill the server. */
         ssize_t s = send(client_fd, data + sent, len - sent, MSG_NOSIGNAL);
         if (s < 0) {
             if (errno == EINTR) {
@@ -486,14 +498,105 @@ static int send_all(int client_fd, const char *data, size_t len)
     return 0;
 }
 
-/* Sendet den Response-Header. suppress_body (HEAD) unterdrückt den Body,
- * behält aber Content-Length bei, damit der Client die GET-Größe erfährt. */
+static void xclose_fd(int fd)
+{
+    if (fd < 0) {
+        return;
+    }
+    while (close(fd) != 0) {
+        if (errno != EINTR) {
+            break;
+        }
+    }
+}
+
+static int open_regular_file(const char *path)
+{
+    /* O_CLOEXEC: the fd must not leak into forked/exec'ed child
+     * processes (fd passing would be a file-permission escalation). */
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return -1;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        xclose_fd(fd);
+        return -1;
+    }
+
+    return fd;
+}
+
+#ifdef __linux__
+#include <sys/sendfile.h>
+/* Streams size bytes from file_fd to the socket. Exactly size — never
+ * more (Content-Length is promised) and never fewer (otherwise the
+ * client would wait for the rest). */
+static int send_fd(int file_fd, off_t size, int client_fd)
+{
+    /* Linux sendfile accepts at most 0x7ffff000 bytes per call. */
+    const off_t MAX_CHUNK = 0x7ffff000;
+    off_t sent_total = 0;
+
+    while (sent_total < size) {
+        off_t chunk = size - sent_total;
+        if (chunk > MAX_CHUNK) {
+            chunk = MAX_CHUNK;
+        }
+        ssize_t sent = sendfile(client_fd, file_fd, NULL, (size_t)chunk);
+        if (sent < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (sent == 0) {
+            return -1; /* file shrank behind our back */
+        }
+        sent_total += sent;
+    }
+    return 0;
+}
+
+#else
+/* Portable fallback (macOS/BSD): read loop with an exact bound. */
+static int send_fd(int file_fd, off_t size, int client_fd)
+{
+    char buf[64 * 1024];
+    off_t remaining = size;
+
+    while (remaining > 0) {
+        size_t want =
+            remaining > (off_t)sizeof(buf) ? sizeof(buf) : (size_t)remaining;
+        ssize_t n = read(file_fd, buf, want);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (n == 0) {
+            return -1; /* file shrank behind our back */
+        }
+        if (send_all(client_fd, buf, (size_t)n) != 0) {
+            return -1;
+        }
+        remaining -= n;
+    }
+    return 0;
+}
+
+#endif /* __linux__ */
+
+/* Sends the response headers. suppress_body (HEAD) suppresses the body
+ * but keeps Content-Length, so the client learns the GET size. */
 static void send_res(HttpResponse *res, int client_fd, bool suppress_body)
 {
     HTTP_ASSERT(res != NULL);
     HTTP_ASSERT(client_fd >= 0);
 
-    /* RFC 9110 §15: Status validieren; ungültig -> 500 statt Müll senden */
+    /* RFC 9110 §15: validate status; invalid -> send 500 instead of garbage */
     if (!is_valid_status_code(res->status)) {
         res->status = HTTP_STATUS_INTERNAL_SERVER_ERROR;
     }
@@ -502,6 +605,27 @@ static void send_res(HttpResponse *res, int client_fd, bool suppress_body)
                            res->status == HTTP_STATUS_NO_CONTENT ||
                            res->status == HTTP_STATUS_RESET_CONTENT ||
                            res->status == HTTP_STATUS_NOT_MODIFIED) != 0;
+
+    /* File streaming: exactly ONE open()+fstat() — the size for
+     * Content-Length comes from the SAME fd that is sent later (no TOCTOU
+     * window between stat() and open()). If the file vanished between
+     * the handler and the send, answer cleanly with 500 and an empty
+     * body instead of a wrong Content-Length. */
+    int file_fd = -1;
+    off_t file_size = 0;
+    if (res->file_path != NULL && !no_body_status) {
+        file_fd = open_regular_file(res->file_path);
+        struct stat st;
+        if (file_fd >= 0 && fstat(file_fd, &st) == 0 && st.st_size >= 0) {
+            file_size = st.st_size;
+        } else {
+            xclose_fd(file_fd);
+            file_fd = -1;
+            res->status = HTTP_STATUS_INTERNAL_SERVER_ERROR;
+            res->body_len = 0;
+        }
+    }
+    bool streaming = file_fd >= 0;
 
     size_t body_len =
         res->encoded_body != NULL ? res->encoded_body_len : res->body_len;
@@ -516,24 +640,26 @@ static void send_res(HttpResponse *res, int client_fd, bool suppress_body)
         snprintf(status_line, sizeof(status_line), "HTTP/1.1 %d %s\r\n",
                  res->status, status_text(res->status));
     if (status_len < 0) {
-        return;
+        goto out;
     }
     if ((size_t)status_len >= sizeof(status_line)) {
         status_len = (int)sizeof(status_line) - 1;
     }
-    send_all(client_fd, status_line, (size_t)status_len);
+    if (send_all(client_fd, status_line, (size_t)status_len) != 0) {
+        goto out;
+    }
 
     if (!no_body_status) {
-        char content_length[64]; /* groß genug für jedes size_t */
+        char content_length[64]; /* large enough for any size_t */
         int cl_len = snprintf(content_length, sizeof(content_length),
-                              "Content-Length: %zu\r\n", body_len);
-        if (cl_len < 0) {
-            return;
+                              "Content-Length: %zu\r\n",
+                              streaming ? (size_t)file_size : body_len);
+        if (cl_len < 0 || (size_t)cl_len >= sizeof(content_length)) {
+            goto out;
         }
-        if ((size_t)cl_len >= sizeof(content_length)) {
-            cl_len = (int)sizeof(content_length) - 1;
+        if (send_all(client_fd, content_length, (size_t)cl_len) != 0) {
+            goto out;
         }
-        send_all(client_fd, content_length, (size_t)cl_len);
     }
 
     bool has_content_type = false;
@@ -545,13 +671,23 @@ static void send_res(HttpResponse *res, int client_fd, bool suppress_body)
         }
     }
 
-    /* Default nur setzen, wenn kein Handler einen gesetzt hat
-     * (keine doppelten Content-Type-Header). */
-    if (!has_content_type && body_len > 0) {
-        /* sizeof() - 1 statt handgerechnetem 24: die harte Laenge war um
-         * eins zu kurz und hat das '\n' abgeschnitten. */
-        send_all(client_fd, "Content-Type: text/html\r\n",
-                 sizeof("Content-Type: text/html\r\n") - 1);
+    /* Set the default only if no handler set one
+     * (no duplicate Content-Type headers). */
+    if (!has_content_type && streaming) {
+        /* Streamed file without handler input: safe download default
+         * instead of text/html (nosniff is set anyway). */
+        if (send_all(client_fd, "Content-Type: application/octet-stream\r\n",
+                     sizeof("Content-Type: application/octet-stream\r\n") -
+                         1) != 0) {
+            goto out;
+        }
+    } else if (!has_content_type && body_len > 0) {
+        /* sizeof() - 1 instead of a hand-computed 24: the hard-coded
+         * length was one byte short and cut off the '\n'. */
+        if (send_all(client_fd, "Content-Type: text/html\r\n",
+                     sizeof("Content-Type: text/html\r\n") - 1) != 0) {
+            goto out;
+        }
     }
 
     for (size_t i = 0; i < res->headers.count; i++) {
@@ -562,42 +698,52 @@ static void send_res(HttpResponse *res, int client_fd, bool suppress_body)
         if (hl <= 0) {
             continue;
         }
-        /* snprintf liefert die hypothetische Länge — auf den Puffer
-         * begrenzen, sonst liest send_all über das Ende hinaus. */
+        /* snprintf returns the hypothetical length — clamp to the
+         * buffer, otherwise send_all reads past the end. */
         if ((size_t)hl >= sizeof(hdr_line)) {
             hl = (int)sizeof(hdr_line) - 1;
         }
-        send_all(client_fd, hdr_line, (size_t)hl);
+        if (send_all(client_fd, hdr_line, (size_t)hl) != 0) {
+            goto out;
+        }
     }
 
-    send_all(client_fd, "\r\n", 2);
+    if (send_all(client_fd, "\r\n", 2) != 0) {
+        goto out;
+    }
+
     if (!no_body_status && !suppress_body) {
-        send_all(client_fd, body, body_len);
+        if (streaming) {
+            (void)send_fd(file_fd, file_size, client_fd);
+        } else {
+            (void)send_all(client_fd, body, body_len);
+        }
     }
 
-    if (res->encoded_body != NULL) {
-        free(res->encoded_body);
-        res->encoded_body = NULL;
-    }
+out:
+    xclose_fd(file_fd);
+    free_encoded_body(res);
+    free(res->file_path);
+    res->file_path = NULL;
 }
 
-/* Request-Line parsen: "METHOD SP request-target SP HTTP-version".
- * Modifiziert line in-place. Rückgabe: 0 = OK, sonst HTTP-Status (400/414/
- * 501/505), der als Response gesendet werden soll. */
+/* Parse a request line: "METHOD SP request-target SP HTTP-version".
+ * Modifies line in place. Returns 0 = OK, otherwise an HTTP status
+ * (400/414/501/505) to send as the response. */
 static int parse_request_line(char *line, HttpRequest *req)
 {
-    /* METHODE */
+    /* method */
     char *sp = strchr(line, ' ');
     if (sp == NULL) {
         return HTTP_STATUS_BAD_REQUEST;
     }
     *sp = '\0';
     if (strlen(line) >= HTTP_METHOD_MAX) {
-        return HTTP_STATUS_NOT_IMPLEMENTED; /* unbekannte/lange Methode */
+        return HTTP_STATUS_NOT_IMPLEMENTED; /* unknown/overlong method */
     }
     strcpy(req->method, line);
 
-    /* request-target (mehrere SP tolerieren, RFC 9112 §2.2) */
+    /* request-target (tolerate multiple SPs, RFC 9112 §2.2) */
     char *target = sp + 1;
     while (*target == ' ') {
         target++;
@@ -608,7 +754,7 @@ static int parse_request_line(char *line, HttpRequest *req)
     }
     *sp = '\0';
 
-    /* Query-String abtrennen: "/users?id=1" -> "/users" */
+    /* Split off the query string: "/users?id=1" -> "/users" */
     char *query = strchr(target, '?');
     if (query != NULL) {
         *query = '\0';
@@ -640,16 +786,15 @@ static int parse_request_line(char *line, HttpRequest *req)
         return HTTP_STATUS_HTTP_VERSION_NOT_SUPPORTED;
     }
 
-    /* RFC 9112 §3.1: request-target muss origin-form sein ("*": nur OPTIONS)
-     */
+    /* RFC 9112 §3.1: request-target must be origin-form ("*": OPTIONS only) */
     HTTP_ASSERT_MSG(is_valid_request_target(req->path, req->method),
                     "RFC 9110 §3.2: invalid request-target");
     return 0;
 }
 
-/* Header-Block parsen (start zeigt direkt hinter die Request-Line, end auf
- * das Ende der empfangenen Bytes). Rückgabe: 0 = OK, sonst HTTP-Status
- * (431/500). Ungültige Zeilen werden übersprungen. */
+/* Parse the header block (start points right after the request line,
+ * end at the end of the received bytes). Returns 0 = OK, otherwise an
+ * HTTP status (431/500). Invalid lines are skipped. */
 static int parse_headers(char *start, const char *end, HttpRequest *req)
 {
     char *cursor = start;
@@ -657,34 +802,34 @@ static int parse_headers(char *start, const char *end, HttpRequest *req)
     while (cursor < end && cursor[0] != '\r' && cursor[0] != '\0') {
         char *line_end = strstr(cursor, "\r\n");
         if (line_end == NULL) {
-            break; /* unvollständige Zeile */
+            break; /* incomplete line */
         }
 
         char *colon = memchr(cursor, ':', (size_t)(line_end - cursor));
-        if (colon == NULL) { /* Zeile ohne ':' -> überspringen */
+        if (colon == NULL) { /* line without ':' -> skip */
             cursor = line_end + 2;
             continue;
         }
 
-        /* Key in-place null-terminieren */
+        /* null-terminate the key in place */
         *colon = '\0';
         char *key = cursor;
 
-        /* Value: nach ':' starten, führenden OWS trimmen */
+        /* value: start after ':', trim leading OWS */
         char *value = colon + 1;
         while (*value == ' ' || *value == '\t') {
             value++;
         }
 
-        /* RFC 9110 §5.5: trailing OWS trimmen (nicht nur leading) */
+        /* RFC 9110 §5.5: trim trailing OWS (not just leading) */
         char *vend = line_end;
         while (vend > value && (vend[-1] == ' ' || vend[-1] == '\t')) {
             vend--;
         }
         *vend = '\0';
 
-        /* Echte Validierung (auch Release): ungültige Feldnamen und
-         * injizierte Werte überspringen statt speichern. */
+        /* Real validation (release too): skip invalid field names and
+         * injected values instead of storing them. */
         if (!is_valid_header_name(key) || header_value_has_injection(value)) {
             cursor = line_end + 2;
             continue;
@@ -703,9 +848,10 @@ static int parse_headers(char *start, const char *end, HttpRequest *req)
     return 0;
 }
 
-/* Request-Body gemäß Content-Length lesen. header_end ist der Offset des
- * ersten Body-Bytes in buf (schon gelesene Bytes werden übernommen).
- * Rückgabe: 0 = OK, sonst HTTP-Status (400/408/413/500/501). */
+/* Read the request body according to Content-Length. header_end is
+ * the offset of the first body byte in buf (already-read bytes are
+ * carried over). Returns 0 = OK, otherwise an HTTP status
+ * (400/408/413/500/501). */
 static int read_body(int client_fd, char *buf, size_t total, size_t header_end,
                      HttpRequest *req)
 {
@@ -727,8 +873,8 @@ static int read_body(int client_fd, char *buf, size_t total, size_t header_end,
             if (end == value || *end != '\0' || errno != 0 || parsed < 0) {
                 return HTTP_STATUS_BAD_REQUEST;
             }
-            /* RFC 9112 §5.2: doppelte Content-Length mit identischem Wert
-             * ist erlaubt, abweichende Werte sind ein Fehler. */
+            /* RFC 9112 §5.2: duplicate Content-Length with an identical
+             * value is allowed; differing values are an error. */
             if (content_length >= 0 && content_length != parsed) {
                 return HTTP_STATUS_BAD_REQUEST;
             }
@@ -736,13 +882,13 @@ static int read_body(int client_fd, char *buf, size_t total, size_t header_end,
         }
     }
 
-    /* Transfer-Encoding wird nicht unterstützt (chunked etc.) */
+    /* Transfer-Encoding is not supported (chunked etc.) */
     if (has_te) {
         return HTTP_STATUS_NOT_IMPLEMENTED;
     }
 
     if (content_length < 0) {
-        return 0; /* kein Body erwartet */
+        return 0; /* no body expected */
     }
     if ((unsigned long long)content_length > HTTP_MAX_BODY) {
         return HTTP_STATUS_CONTENT_TOO_LARGE;
@@ -753,11 +899,10 @@ static int read_body(int client_fd, char *buf, size_t total, size_t header_end,
         return HTTP_STATUS_INTERNAL_SERVER_ERROR;
     }
 
-    /* Bytes, die zusammen mit den Headern gelesen wurden */
+    /* bytes already read together with the headers */
     size_t leftover = total - header_end;
     if (leftover > (size_t)content_length) {
-        /* mehr Body-Bytes als laut Content-Length -> Request-Smuggling-Risiko
-         */
+        /* more body bytes than Content-Length says -> request smuggling risk */
         free(req->body);
         req->body = NULL;
         return HTTP_STATUS_BAD_REQUEST;
@@ -774,9 +919,9 @@ static int read_body(int client_fd, char *buf, size_t total, size_t header_end,
             }
             free(req->body);
             req->body = NULL;
-            return HTTP_STATUS_REQUEST_TIMEOUT; /* Timeout/Fehler */
+            return HTTP_STATUS_REQUEST_TIMEOUT; /* timeout/error */
         }
-        if (r == 0) { /* Client mitten im Body verschwunden */
+        if (r == 0) { /* client vanished mid-body */
             free(req->body);
             req->body = NULL;
             return HTTP_STATUS_BAD_REQUEST;
@@ -813,9 +958,6 @@ static void apply_default_headers(HttpResponse *res, HttpServer *server)
                  "geolocation=(), camera=(), microphone=()");
     apply_header(&res->headers, HTTP_HEADER_ACCEPT_RANGES, "bytes");
     apply_header(&res->headers, HTTP_HEADER_VARY, "Accept-Encoding");
-
-    /* Kein Default-Content-Type: send_res() setzt ihn nur, wenn der
-     * Handler keinen gesetzt hat. */
 }
 
 static bool apply_middleware(HttpServer *server, HttpRequest *req,
@@ -870,8 +1012,8 @@ static HandlerResult execute_handler(HttpServer *server, HttpRequest *req,
         }
     }
 
-    /* RFC 9110 §9.3.2: HEAD fällt auf GET zurück, wenn keine explizite
-     * HEAD-Route existiert (Body wird beim Senden unterdrückt). */
+    /* RFC 9110 §9.3.2: HEAD falls back to GET when no explicit HEAD
+     * route exists (the body is suppressed at send time). */
     if (handler == NULL && m == HTTP_METHOD_HEAD) {
         for (size_t i = 0; i < server->route_count; i++) {
             if (strcmp(req->path, server->routes[i].path) != 0) {
@@ -885,6 +1027,16 @@ static HandlerResult execute_handler(HttpServer *server, HttpRequest *req,
     }
 
     if (handler == NULL) {
+        /* No exact route: next, check the static file mounts
+         * (exact routes win over mounts). */
+        switch (http_static_dispatch(server, req, res)) {
+        case HTTP_STATIC_SERVED:
+            return HANDLER_OK;
+        case HTTP_STATIC_METHOD_NOT_ALLOWED:
+            return HANDLER_METHOD_NOT_ALLOWED;
+        case HTTP_STATIC_NOT_MATCHED:
+            break;
+        }
         return (int)path_exists ? HANDLER_METHOD_NOT_ALLOWED
                                 : HANDLER_NOT_FOUND;
     }
@@ -893,7 +1045,7 @@ static HandlerResult execute_handler(HttpServer *server, HttpRequest *req,
     return HANDLER_OK;
 }
 
-/* RFC 9110 §15.4.6: bei 405 gehört ein Allow-Header dazu */
+/* RFC 9110 §15.4.6: a 405 response includes an Allow header */
 static void set_allow_header(HttpServer *server, const char *path,
                              HttpResponse *res)
 {
@@ -934,40 +1086,40 @@ static void handle_client(HttpServer *server, int client_fd, const char *ip,
     char buf[4096];
     bool headers_complete = false;
 
-    /* Erst lesen, dann allozieren: bei Lesefehlern gibt es nichts zu
-     * räumen und keine Response-Puffer-Header, die leaken könnten. */
+    /* Read first, allocate later: on read errors there is nothing to
+     * clean up and no response buffer headers that could leak. */
     ssize_t total =
         read_request(client_fd, buf, sizeof(buf), &headers_complete);
     if (total < 0) {
-        return; /* recv-Fehler oder Timeout — nur schließen */
+        return; /* recv error or timeout — just close */
     }
     if (total == 0) {
-        return; /* Client hat sofort geschlossen */
+        return; /* client closed immediately */
     }
 
     HttpRequest req = {0};
     HttpResponse res = {0};
     apply_default_headers(&res, server);
 
-    /* Jeder Fehlerpfad springt zu send: es wird IMMER eine Response
-     * gesendet (kein stummes Connection-Close) und NUR am Ende geräumt. */
+    /* Every error path jumps to send: a response is ALWAYS sent (no
+     * silent connection close) and cleanup happens ONLY at the end. */
     if (!headers_complete) {
         res.status = HTTP_STATUS_REQUEST_HEADER_FIELDS_TOO_LARGE; /* 431 */
         goto send;
     }
 
     {
-        /* Position des Body-Starts VOR dem Terminieren holen (leerer
-         * Header-Block: eol und Marker fallen zusammen). */
+        /* Get the body start position BEFORE terminating (empty header
+         * block: eol and marker coincide). */
         char *sep = strstr(buf, "\r\n\r\n");
-        if (sep == NULL) { /* kann bei headers_complete nicht passieren */
+        if (sep == NULL) { /* cannot happen with headers_complete */
             res.status = HTTP_STATUS_BAD_REQUEST;
             goto send;
         }
         size_t header_end = (size_t)(sep - buf) + 4;
 
-        /* Request-Line isolieren (beim ersten CRLF terminieren), dann
-         * parsen; parse_headers startet direkt dahinter. */
+        /* Isolate the request line (terminate at the first CRLF), then
+         * parse; parse_headers starts right after it. */
         char *eol = strstr(buf, "\r\n");
         if (eol == NULL) {
             res.status = HTTP_STATUS_BAD_REQUEST;
@@ -995,7 +1147,7 @@ static void handle_client(HttpServer *server, int client_fd, const char *ip,
         }
     }
 
-    /* RFC 9112 §3.2: Host-Header in HTTP/1.1 Pflicht (Debug-Check) */
+    /* RFC 9112 §3.2: Host header mandatory in HTTP/1.1 (debug check) */
 #ifndef NDEBUG
     if (strcmp(req.version, "HTTP/1.1") == 0) {
         bool has_host = false;
@@ -1032,7 +1184,7 @@ send:
         res.status = HTTP_STATUS_INTERNAL_SERVER_ERROR;
     }
 
-    /* RFC 9110 §15: Status vor dem Senden validieren */
+    /* RFC 9110 §15: validate the status before sending */
     HTTP_ASSERT_MSG(is_valid_status_code(res.status),
                     "RFC 9110 §15: status code must be 100-599 before send");
     HTTP_ASSERT_MSG(res.body_len <= sizeof(res.body),
@@ -1040,8 +1192,8 @@ send:
 
     http_encode_body(server, &req, &res);
 
-    /* RFC 9110 §9.3.2: HEAD-Responses haben keinen Body (die Header
-     * entsprechen denen eines GET, inklusive Content-Length). */
+    /* RFC 9110 §9.3.2: HEAD responses have no body (the headers match
+     * those of a GET, including Content-Length). */
     bool suppress_body = strcmp(req.method, "HEAD") == 0;
     send_res(&res, client_fd, suppress_body);
 
@@ -1061,8 +1213,8 @@ HttpServerResult http_create_server(const ServerArgs *server_args,
         return SERVER_ERROR;
     }
 
-    /* out deterministisch initialisieren — auch im Fehlerfall ist der
-     * Server danach sicher zu schließen/zu leeren. */
+    /* Initialize out deterministically — even on failure the server is
+     * then safe to close/empty. */
     memset(out, 0, sizeof(*out));
     out->fd = -1;
 
@@ -1112,14 +1264,14 @@ HttpServerResult http_create_server(const ServerArgs *server_args,
 
     out->routes = malloc(HTTP_ROUTE_INITIAL_CAP * sizeof(HttpRoute));
     if (out->routes == NULL) {
-        close(server_fd); /* Socket nicht leaken */
+        close(server_fd); /* don't leak the socket */
         return SERVER_ERROR;
     }
     out->route_count = 0;
     out->route_capacity = HTTP_ROUTE_INITIAL_CAP;
 
-    /* server_name wird kopiert — die Library hängt nicht am Speicher des
-     * Aufrufers. */
+    /* server_name is copied — the library does not depend on the
+     * caller's memory. */
     out->server_name = strdup(server_args->server_name);
     if (out->server_name == NULL) {
         free(out->routes);
@@ -1151,10 +1303,10 @@ void http_close_server(HttpServer *server)
         return;
     }
 
-    /* fd >= 0 statt fd != 0: fd 0 ist ein gültiger Socket-Descriptor. */
+    /* fd >= 0 instead of fd != 0: fd 0 is a valid socket descriptor. */
     if (server->fd >= 0) {
         close(server->fd);
-        server->fd = -1; /* gegen Double-Close schützen */
+        server->fd = -1; /* protect against a double close */
     }
 
     for (size_t i = 0; i < server->route_count; i++) {
@@ -1175,6 +1327,8 @@ void http_close_server(HttpServer *server)
     server->encoders = NULL;
     server->encoder_count = server->encoder_capacity = 0;
 
+    http_static_mounts_free(server);
+
     free(server->server_name);
     server->server_name = NULL;
 }
@@ -1186,8 +1340,8 @@ void http_stop_server(HttpServer *server)
     }
 
     server->listening = false;
-    /* Weckt ein blockierendes accept() auf (async-signal-safe: nur
-     * syscall + Flag). */
+    /* Wake up a blocking accept() (async-signal-safe: just a syscall
+     * plus a flag). */
     if (server->fd >= 0) {
         shutdown(server->fd, SHUT_RDWR);
     }
@@ -1215,14 +1369,14 @@ void http_listen(HttpServer *server)
                 continue;
             }
             if (errno == EBADF || errno == EINVAL) {
-                break; /* Socket geschlossen (http_stop_server) */
+                break; /* socket closed (http_stop_server) */
             }
             perror("accept");
             continue;
         }
 
-        /* Slowloris-Schutz: recv/send dürfen den Server nicht ewig
-         * blockieren. */
+        /* Slowloris protection: recv/send must not block the server
+         * forever. */
         struct timeval tv = {.tv_sec = HTTP_CLIENT_TIMEOUT_SEC, .tv_usec = 0};
         setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
@@ -1254,8 +1408,8 @@ static HttpRouteAddResult http_add_route(HttpServer *server, const char *path,
         return HTTP_ROUTE_ADD_ERROR;
     }
 
-    /* Route, die länger ist als HTTP_PATH_MAX, kann nie matchen (der
-     * Request-Path wird auf HTTP_PATH_MAX begrenzt) — sofort ablehnen. */
+    /* A route longer than HTTP_PATH_MAX can never match (the request
+     * path is capped at HTTP_PATH_MAX) — reject immediately. */
     if (strlen(path) >= HTTP_PATH_MAX) {
         return HTTP_ROUTE_ADD_ERROR;
     }
@@ -1393,8 +1547,8 @@ HttpSetHeaderResult http_set_header(HttpHeaders *headers, const char *key,
         return HTTP_SET_HEADER_ERROR;
     }
 
-    /* apply_header validiert echte Guards (Feldname, CR/LF-Injection)
-     * — auch im Release-Build. */
+    /* apply_header validates the real guards (field name, CR/LF
+     * injection) — also in release builds. */
     if (apply_header(headers, key, value) < 0) {
         return HTTP_SET_HEADER_ERROR;
     }
@@ -1405,7 +1559,7 @@ HttpSetHeaderResult http_set_header(HttpHeaders *headers, const char *key,
  * Route Groups
  * ============================================================ */
 
-/* false, wenn das Ergebnis nicht in out passt (Truncation). */
+/* false if the result does not fit into out (truncation). */
 static bool join_path(char *out, size_t size, const char *prefix,
                       const char *path)
 {
@@ -1466,7 +1620,7 @@ HttpMiddlewareAddResult http_group_middleware(HttpGroup *group,
     }
 
     if (path == NULL) {
-        /* Group-scoped middleware: group prefix als Pfad */
+        /* Group-scoped middleware: group prefix as the path */
         return http_middleware(group->server, group->prefix, handler);
     }
 

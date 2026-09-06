@@ -110,7 +110,7 @@ HttpEncoderAddResult http_register_encoder(HttpServer *server,
 void http_headers_free(HttpHeaders *headers)
 {
     if (headers == NULL) {
-        return; /* NULL ist erlaubt — no-op */
+        return; /* NULL is allowed — no-op */
     }
     for (size_t i = 0; i < headers->count; i++) {
         free(headers->items[i].key);
@@ -123,16 +123,16 @@ void http_headers_free(HttpHeaders *headers)
 
 /* --- content negotiation --- */
 
-/* Parst ";q=0.5"-Parameter ab *pp (zeigt auf ';'). Liefert den q-Wert
- * (Default 1.0 bei unparsebarem/nicht vorhandenem q) und rückt *pp bis
- * zum nächsten ';' oder ',' vor. */
+/* Parses ";q=0.5" parameters from *pp (pointing at ';'). Returns the q
+ * value (default 1.0 for an unparseable/missing q) and advances *pp up
+ * to the next ';' or ',' */
 static double parse_q(const char **pp)
 {
     const char *p = *pp;
     double q = 1.0;
 
     while (*p == ';') {
-        p++; /* ';' überspringen */
+        p++; /* skip ';' */
         while (*p == ' ' || *p == '\t')
             p++;
 
@@ -153,10 +153,9 @@ static double parse_q(const char **pp)
     return q;
 }
 
-/* RFC 9110 §12.5.6: Accept-Encoding berücksichtigt q-Werte (q=0 =
- * explizit verboten) und behandelt alle Accept-Encoding-Header (nicht
- * nur den ersten). "*" matcht nur Encodings, die nicht explizit gelistet
- * sind. */
+/* RFC 9110 §12.5.6: Accept-Encoding honors q-values (q=0 = explicitly
+ * forbidden) and considers all Accept-Encoding headers (not just the
+ * first). "*" only matches encodings that are not explicitly listed. */
 bool http_accepts_encoding(const HttpRequest *req, const char *encoding)
 {
     if (req == NULL || encoding == NULL || *encoding == '\0')
@@ -180,7 +179,7 @@ bool http_accepts_encoding(const HttpRequest *req, const char *encoding)
             if (*p == '\0')
                 break;
 
-            /* Coding-Name lesen (bis ',' oder ';') */
+            /* read the coding name (until ',' or ';') */
             const char *name_start = p;
             while (*p && *p != ',' && *p != ';')
                 p++;
@@ -206,10 +205,10 @@ bool http_accepts_encoding(const HttpRequest *req, const char *encoding)
             } else if (match) {
                 specific_found = true;
                 if (q > 0.0)
-                    specific_ok = true; /* höchstes q gewinnt */
+                    specific_ok = true; /* highest q wins */
             }
 
-            /* Zum nächsten Listenelement springen */
+            /* skip to the next list element */
             while (*p && *p != ',')
                 p++;
             if (*p == ',')
@@ -217,7 +216,7 @@ bool http_accepts_encoding(const HttpRequest *req, const char *encoding)
         }
     }
 
-    /* Explizite Nennung schlägt Wildcard: "gzip;q=0, *" lehnt gzip ab. */
+    /* Explicit mention beats the wildcard: "gzip;q=0, *" rejects gzip. */
     if (specific_found)
         return specific_ok;
     return wildcard_found && wildcard_q > 0.0;
@@ -237,7 +236,7 @@ bool http_encode_body(HttpServer *server, const HttpRequest *req,
         return false;
     }
 
-    /* Prüfen ob der Handler schon Content-Encoding gesetzt hat */
+    /* Check whether the handler already set Content-Encoding */
     for (size_t i = 0; i < res->headers.count; i++) {
         if (strcasecmp(res->headers.items[i].key,
                        HTTP_HEADER_CONTENT_ENCODING) == 0) {
@@ -245,7 +244,7 @@ bool http_encode_body(HttpServer *server, const HttpRequest *req,
         }
     }
 
-    /* Registrierte Encoder durchprobieren */
+    /* Try the registered encoders */
     for (size_t i = 0; i < server->encoder_count; i++) {
         if (!http_accepts_encoding(req, server->encoders[i].name)) {
             continue;
@@ -258,7 +257,7 @@ bool http_encode_body(HttpServer *server, const HttpRequest *req,
             continue;
         }
 
-        /* Überspringen wenn Encoding den Body größer gemacht hat */
+        /* Skip if the encoding made the body larger */
         if (encoded_len >= res->body_len) {
             free(encoded);
             continue;

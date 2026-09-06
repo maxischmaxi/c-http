@@ -31,17 +31,19 @@ ROOT_DIR = os.path.dirname(SCRIPT_DIR)
 HEADER_FILES = [
     os.path.join(ROOT_DIR, "include", "c_http.h"),
     os.path.join(ROOT_DIR, "include", "c_http_assert.h"),
+    os.path.join(ROOT_DIR, "include", "c_http_static.h"),
 ]
 
 SOURCE_FILES = [
     os.path.join(ROOT_DIR, "src", "c_http.c"),
     os.path.join(ROOT_DIR, "src", "c_http_encoder.c"),
+    os.path.join(ROOT_DIR, "src", "c_http_static.c"),
 ]
 
 OUTPUT_DEFAULT = os.path.join(ROOT_DIR, "c_http_single.h")
 
 # Our own includes to strip during amalgamation
-OUR_HEADERS = {"c_http.h", "c_http_assert.h"}
+OUR_HEADERS = {"c_http.h", "c_http_assert.h", "c_http_static.h"}
 
 
 def strip_include_guard(content):

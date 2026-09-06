@@ -79,6 +79,8 @@ target_link_libraries(my-app PRIVATE c_http::c_http)
 | Request body (`Content-Length`)       | ✅     |
 | Accept-Encoding q-values (RFC 9110)   | ✅     |
 | Custom encoder plugin system          | ✅     |
+| Static file serving (`http_static_mount`) | ✅ |
+| File streaming (`res->file_path`)      | ✅     |
 | Graceful shutdown (`http_stop_server`)| ✅     |
 | Slowloris protection (socket timeout) | ✅     |
 | HTTP spec asserts (debug builds)     | ✅     |

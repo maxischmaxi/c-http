@@ -9,12 +9,12 @@
 
 #define HTTP_ROUTE_INITIAL_CAP 8
 
-/* Parsing-Grenzen: Puffergrößen müssen zu diesen Werten passen. */
-#define HTTP_METHOD_MAX  8 /* längste bekannte Methode: "CONNECT" */
+/* Parsing limits: buffer sizes must match these values. */
+#define HTTP_METHOD_MAX  8 /* longest known method: "CONNECT" */
 #define HTTP_PATH_MAX    512
 #define HTTP_VERSION_MAX 16
-#define HTTP_MAX_HEADERS 64              /* mehr Request-Header -> 431 */
-#define HTTP_MAX_BODY    (1024u * 1024u) /* größerer Request-Body -> 413 */
+#define HTTP_MAX_HEADERS 64              /* more request headers -> 431 */
+#define HTTP_MAX_BODY    (1024u * 1024u) /* larger request body -> 413 */
 
 #define HTTP_HEADER_A_IM            "A-IM"
 #define HTTP_HEADER_ACCEPT          "Accept"
@@ -280,8 +280,8 @@ typedef struct {
     char path[HTTP_PATH_MAX];
     char version[HTTP_VERSION_MAX];
     HttpHeaders headers;
-    /* Request-Body (NUL-terminiert; von der Library allokiert und nach dem
-     * Request wieder freigegeben). NULL wenn kein Body gesendet wurde. */
+    /* Request body (NUL-terminated; allocated by the library and freed
+     * after the request). NULL if no body was sent. */
     char *body;
     size_t body_len;
 } HttpRequest;
@@ -293,6 +293,11 @@ typedef struct {
     HttpHeaders headers;
     char *encoded_body;
     size_t encoded_body_len;
+    /* File streaming: if the handler sets this heap-allocated path
+     * (malloc/strdup — ownership passes to the response), the library
+     * sends the file as the body (instead of body/encoded_body) and
+     * frees the memory afterwards. NULL = regular body. */
+    char *file_path;
 } HttpResponse;
 
 typedef void (*HttpHandler)(const HttpRequest *req, HttpResponse *res);
@@ -325,6 +330,10 @@ typedef struct {
     size_t encoder_count;
     size_t encoder_capacity;
     char *server_name;
+    /* Opaque mount list for static files — owned and managed by
+     * c_http_static.c (see c_http_static.h). NULL while nothing is
+     * mounted; http_close_server() frees it. */
+    void *static_mounts;
 } HttpServer;
 
 typedef struct {
@@ -336,9 +345,9 @@ HttpServerResult http_create_server(const ServerArgs *server_args,
                                     HttpServer *out);
 void http_close_server(HttpServer *server);
 void http_listen(HttpServer *server);
-/* Stoppt den laufenden http_listen()-Loop (async-signal-safe: darf aus einem
- * Signal-Handler gerufen werden). Der lauschende Socket wird heruntergefahren,
- * damit ein blockierendes accept() sofort zurückkehrt. */
+/* Stops the running http_listen() loop (async-signal-safe: may be
+ * called from a signal handler). The listening socket is shut down so
+ * a blocking accept() returns immediately. */
 void http_stop_server(HttpServer *server);
 HttpRouteAddResult http_get(HttpServer *server, const char *path,
                             HttpHandler handler);

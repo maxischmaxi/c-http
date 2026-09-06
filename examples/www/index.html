@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>c-http static files</title>
+    <link rel="stylesheet" href="/public/style.css">
+</head>
+<body>
+    <h1>c-http static file server</h1>
+    <p>This page is served by <code>http_static_mount()</code>.</p>
+    <ul>
+        <li><a href="/public/style.css">style.css</a> (text/css)</li>
+        <li><a href="/public/app.js">app.js</a> (~10 KB, streamed)</li>
+        <li><a href="/public/data/users.json">data/users.json</a> (subdirectory)</li>
+        <li><a href="/public/nope.html">nope.html</a> (404)</li>
+        <li><a href="/public/../secret">../secret</a> (blocked)</li>
+    </ul>
+    <p>Index file works: this is <code>index.html</code> via <code>/public</code>.</p>
+</body>
+</html>

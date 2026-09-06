@@ -22,6 +22,14 @@ static struct cag_option options[] = {
         .value_name = "ADDR",
         .description = "Address which gets bound (default: 0.0.0.0)",
     },
+    {
+        .identifier = 'r',
+        .access_letters = "r",
+        .access_name = "root",
+        .value_name = "DIR",
+        .description =
+            "Root directory for static files (default: examples/www)",
+    },
     {.identifier = 'v',
      .access_letters = "v",
      .access_name = "verbose",
@@ -55,6 +63,7 @@ ArgsResult parse_args(int argc, char **argv, Args *out)
     Args args = {
         .port = 80,
         .bind_addr = "0.0.0.0",
+        .root = "examples/www",
         .verbose = false,
     };
 
@@ -83,6 +92,15 @@ ArgsResult parse_args(int argc, char **argv, Args *out)
                 return ARGS_ERROR;
             }
             args.bind_addr = val;
+            break;
+        }
+        case 'r': {
+            const char *val = cag_option_get_value(&context);
+            if (val == NULL) {
+                fprintf(stderr, "missing value for --root\n");
+                return ARGS_ERROR;
+            }
+            args.root = val;
             break;
         }
         case 'v':

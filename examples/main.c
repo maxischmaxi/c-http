@@ -11,10 +11,11 @@
 #include "args.h"
 #include "c_http.h"
 #include "c_http_assert.h"
+#include "c_http_static.h"
 
 static HttpServer *g_server = NULL;
 
-/* Async-signal-safe: http_stop_server nutzt nur ein Flag + shutdown(). */
+/* Async-signal-safe: http_stop_server only uses a flag + shutdown(). */
 static void on_terminate(int sig)
 {
     (void)sig;
@@ -194,6 +195,19 @@ int main(int argc, char **argv)
 
     /* --- Top-level routes --- */
     http_get(&server, "/", home_handler);
+
+    /* --- Static files: /public/<path> is served from args.root.
+     * Files larger than the 4-KiB body buffer are streamed. --- */
+    if (http_static_mount(&server, &(HttpStaticConfig){
+                                       .prefix = "/public",
+                                       .root = args.root,
+                                       .index_file = "index.html",
+                                       .max_age = 3600,
+                                   }) == SERVER_ERROR) {
+        fprintf(stderr, "failed to mount static root '%s'\n", args.root);
+        http_close_server(&server);
+        return 1;
+    }
 
     /* --- /api group: auth required for all routes --- */
     HttpGroup api = http_group(&server, "/api");

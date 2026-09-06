@@ -61,6 +61,7 @@ endfunction()
 add_library(c_http STATIC
   src/c_http.c
   src/c_http_encoder.c
+  src/c_http_static.c
 )
 target_include_directories(c_http PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -95,8 +96,10 @@ if(C_HTTP_AMALGAMATE)
     DEPENDS
       ${CMAKE_CURRENT_SOURCE_DIR}/include/c_http.h
       ${CMAKE_CURRENT_SOURCE_DIR}/include/c_http_assert.h
+      ${CMAKE_CURRENT_SOURCE_DIR}/include/c_http_static.h
       ${CMAKE_CURRENT_SOURCE_DIR}/src/c_http.c
       ${CMAKE_CURRENT_SOURCE_DIR}/src/c_http_encoder.c
+      ${CMAKE_CURRENT_SOURCE_DIR}/src/c_http_static.c
       ${CMAKE_CURRENT_SOURCE_DIR}/scripts/amalgamate.py
     COMMENT "Generating single-header amalgamation"
   )

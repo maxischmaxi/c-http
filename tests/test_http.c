@@ -16,11 +16,13 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "c_http.h"
+#include "c_http_static.h"
 #include "test.h"
 
 #define TEST_PORT_START 18431
@@ -178,7 +180,7 @@ static void test_accepts_encoding(void)
 {
     HttpRequest req = {0};
 
-    /* kein Accept-Encoding -> nichts akzeptiert */
+    /* no Accept-Encoding -> nothing accepted */
     CHECK(http_accepts_encoding(&req, "gzip") == false);
 
     struct {
@@ -188,16 +190,16 @@ static void test_accepts_encoding(void)
     } cases[] = {
         {"gzip", true, "plain gzip"},
         {"deflate, gzip;q=1.0", true, "gzip;q=1.0"},
-        {"gzip;q=0", false, "gzip;q=0 verboten"},
-        {"gzip;q=0.0", false, "gzip;q=0.0 verboten"},
+        {"gzip;q=0", false, "gzip;q=0 forbidden"},
+        {"gzip;q=0.0", false, "gzip;q=0.0 forbidden"},
         {"*", true, "wildcard"},
-        {"gzip;q=0, *", false, "explizit q=0 schlaegt wildcard"},
-        {"br, *", true, "wildcard fuer ungenanntes"},
+        {"gzip;q=0, *", false, "explicit q=0 beats wildcard"},
+        {"br, *", true, "wildcard for unnamed coding"},
         {"GZIP", true, "case-insensitive"},
-        {"gzipx", false, "kein Prefix-Match"},
-        {"xgzip", false, "kein Suffix-Match"},
-        {"gzip;q=0.5;foo=bar", true, "q mit Parametern"},
-        {"deflate, br", false, "gzip nicht gelistet"},
+        {"gzipx", false, "no prefix match"},
+        {"xgzip", false, "no suffix match"},
+        {"gzip;q=0.5;foo=bar", true, "q with parameters"},
+        {"deflate, br", false, "gzip not listed"},
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         http_set_header(&req.headers, HTTP_HEADER_ACCEPT_ENCODING,
@@ -207,7 +209,7 @@ static void test_accepts_encoding(void)
         http_headers_free(&req.headers);
     }
 
-    /* mehrere Accept-Encoding-Header werden alle beruecksichtigt */
+    /* multiple Accept-Encoding headers are all considered */
     http_set_header(&req.headers, HTTP_HEADER_ACCEPT_ENCODING, "deflate");
     http_set_header(&req.headers, HTTP_HEADER_ACCEPT_ENCODING, "gzip");
     CHECK(http_accepts_encoding(&req, "gzip") == true);
@@ -218,20 +220,20 @@ static void test_set_header_validation(void)
 {
     HttpHeaders h = {0};
 
-    /* Header-Injection muss zurueckgewiesen werden — auch im Release-Build */
+    /* header injection must be rejected — also in release builds */
     CHECK(http_set_header(&h, "X-Test", "value\r\nSet-Cookie: pwned=1") ==
           HTTP_SET_HEADER_ERROR);
     CHECK(http_set_header(&h, "X-Test", "value\nSet-Cookie: pwned=1") ==
           HTTP_SET_HEADER_ERROR);
 
-    /* ungueltige Feldnamen */
+    /* invalid field names */
     CHECK(http_set_header(&h, "Bad Name", "value") == HTTP_SET_HEADER_ERROR);
     CHECK(http_set_header(&h, "", "value") == HTTP_SET_HEADER_ERROR);
     CHECK(http_set_header(&h, "X-Test:", "value") == HTTP_SET_HEADER_ERROR);
     CHECK(http_set_header(&h, "X-Bad\x01Name", "value") ==
           HTTP_SET_HEADER_ERROR);
 
-    /* gueltig */
+    /* valid */
     CHECK(http_set_header(&h, "X-Test", "value") == HTTP_SET_HEADER_OK);
     CHECK(h.count == 1);
 
@@ -244,19 +246,19 @@ static void test_route_limits(void)
     HttpServer srv;
     CHECK(http_create_server(&args, &srv) == SERVER_OK);
 
-    /* Route laenger als HTTP_PATH_MAX kann nie matchen -> ablehnen */
+    /* a route longer than HTTP_PATH_MAX can never match -> reject */
     char long_path[HTTP_PATH_MAX + 2];
     long_path[0] = '/';
     memset(long_path + 1, 'a', HTTP_PATH_MAX);
     long_path[HTTP_PATH_MAX + 1] = '\0';
     CHECK(http_get(&srv, long_path, h_root) == HTTP_ROUTE_ADD_ERROR);
 
-    /* Konflikt-Erkennung */
+    /* conflict detection */
     CHECK(http_get(&srv, "/x", h_root) == HTTP_ROUTE_ADD_OK);
     CHECK(http_get(&srv, "/x", h_root) == HTTP_ROUTE_ADD_CONFLICT);
     CHECK(http_post(&srv, "/x", h_root) == HTTP_ROUTE_ADD_OK);
 
-    /* Group: Prefix zu lang -> Truncation wird erkannt */
+    /* group: prefix too long -> truncation is detected */
     char big_prefix[600];
     big_prefix[0] = '/';
     memset(big_prefix + 1, 'p', sizeof(big_prefix) - 2);
@@ -264,11 +266,11 @@ static void test_route_limits(void)
     HttpGroup g = http_group(&srv, big_prefix);
     CHECK(http_group_get(&g, "/deep", h_root) == HTTP_ROUTE_ADD_ERROR);
 
-    /* fd == -1 und Double-Close muessen ueberleben */
+    /* fd == -1 and double close must survive */
     http_close_server(&srv);
     http_close_server(&srv);
 
-    /* ServerArgs mit NULL-Werten */
+    /* ServerArgs with NULL values */
     HttpServer srv2;
     ServerArgs bad = {0};
     CHECK(http_create_server(&bad, &srv2) == SERVER_ERROR);
@@ -284,7 +286,7 @@ static void test_group_paths(void)
     CHECK(http_group_get(&api, "/users", h_root) == HTTP_ROUTE_ADD_OK);
     CHECK(http_group_get(&api, "/", h_root) == HTTP_ROUTE_ADD_OK);
 
-    /* "/api/users" und "/api" registriert */
+    /* "/api/users" and "/api" registered */
     bool found_users = false, found_api = false;
     for (size_t i = 0; i < srv.route_count; i++) {
         if (strcmp(srv.routes[i].path, "/api/users") == 0)
@@ -334,48 +336,48 @@ static void test_integration(void)
     char rsp[64 * 1024];
     size_t n;
 
-    /* 1) GET / -> 200 + Body + genau EIN Content-Type */
+    /* 1) GET / -> 200 + body + exactly ONE Content-Type */
     n = get("GET / HTTP/1.1\r\nHost: t\r\n\r\n", rsp, sizeof(rsp));
     CHECK(n > 0);
     CHECK(strncmp(rsp, "HTTP/1.1 200", 12) == 0);
     CHECK(count_occurrences(rsp, "Content-Type:") == 1);
     CHECK(strstr(rsp, "\r\n\r\nok") != NULL);
 
-    /* 2) Query-String wird abgetrennt */
+    /* 2) the query string is split off */
     n = get("GET /?x=1&y=2 HTTP/1.1\r\nHost: t\r\n\r\n", rsp, sizeof(rsp));
     CHECK(n > 0);
     CHECK(strncmp(rsp, "HTTP/1.1 200", 12) == 0);
 
-    /* 3) HEAD faellt auf GET zurueck und sendet keinen Body */
+    /* 3) HEAD falls back to GET and sends no body */
     n = get("HEAD / HTTP/1.1\r\nHost: t\r\n\r\n", rsp, sizeof(rsp));
     CHECK(n > 0);
     CHECK(strncmp(rsp, "HTTP/1.1 200", 12) == 0);
     CHECK(strstr(rsp, "Content-Length: 2") != NULL);
-    CHECK(strcmp(rsp + strlen(rsp) - 4, "\r\n\r\n") == 0); /* kein Body */
+    CHECK(strcmp(rsp + strlen(rsp) - 4, "\r\n\r\n") == 0); /* no body */
 
-    /* 4) falsche Methode -> 405 + Allow */
+    /* 4) wrong method -> 405 + Allow */
     n = get("POST /only-get HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n",
             rsp, sizeof(rsp));
     CHECK(n > 0);
     CHECK(strncmp(rsp, "HTTP/1.1 405", 12) == 0);
     CHECK(strstr(rsp, "Allow: GET") != NULL);
 
-    /* 5) unbekannte/zu lange Methode -> 501 */
+    /* 5) unknown/overlong method -> 501 */
     n = get("PROPFINDX / HTTP/1.1\r\nHost: t\r\n\r\n", rsp, sizeof(rsp));
     CHECK(n > 0);
     CHECK(strncmp(rsp, "HTTP/1.1 501", 12) == 0);
 
-    /* 6) kaputte Request-Line -> 400, es WIRD eine Response gesendet */
+    /* 6) broken request line -> 400, a response IS sent */
     n = get("GARBAGE\r\n\r\n", rsp, sizeof(rsp));
     CHECK(n > 0);
     CHECK(strncmp(rsp, "HTTP/1.1 400", 12) == 0);
 
-    /* 7) 2-Felder-Request-Line -> 400 */
+    /* 7) two-field request line -> 400 */
     n = get("GET /\r\n\r\n", rsp, sizeof(rsp));
     CHECK(n > 0);
     CHECK(strncmp(rsp, "HTTP/1.1 400", 12) == 0);
 
-    /* 8) zu langer URI -> 414 */
+    /* 8) overlong URI -> 414 */
     char long_req[1024];
     strcpy(long_req, "GET /");
     for (int i = 0; i < 600; i++)
@@ -390,7 +392,7 @@ static void test_integration(void)
     CHECK(n > 0);
     CHECK(strncmp(rsp, "HTTP/1.1 505", 12) == 0);
 
-    /* 10) Header > 4096 Bytes -> 431 */
+    /* 10) headers > 4096 bytes -> 431 */
     static char huge[8192];
     memset(huge, 'H', sizeof(huge) - 1);
     memcpy(huge, "GET / HTTP/1.1\r\nHost: t\r\nX-Big: ", 32);
@@ -410,21 +412,21 @@ static void test_integration(void)
     CHECK(strncmp(rsp, "HTTP/1.1 200", 12) == 0);
     CHECK(strstr(rsp, "Content-Encoding: gzip") != NULL);
 
-    /* 12) gzip;q=0 -> KEIN gzip */
+    /* 12) gzip;q=0 -> NO gzip */
     n = get("GET /big HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip;q=0\r\n\r\n",
             rsp, sizeof(rsp));
     CHECK(n > 0);
     CHECK(strncmp(rsp, "HTTP/1.1 200", 12) == 0);
     CHECK(strstr(rsp, "Content-Encoding:") == NULL);
 
-    /* 13) gzip;q=0, * -> gzip bleibt verboten (explizit schlaegt Wildcard) */
+    /* 13) gzip;q=0, * -> gzip stays forbidden (explicit beats wildcard) */
     n = get("GET /big HTTP/1.1\r\nHost: t\r\n"
             "Accept-Encoding: gzip;q=0, *\r\n\r\n",
             rsp, sizeof(rsp));
     CHECK(n > 0);
     CHECK(strstr(rsp, "Content-Encoding: gzip") == NULL);
 
-    /* 14) POST-Body wird gelesen und ist im Handler verfuegbar */
+    /* 14) the POST body is read and available in the handler */
     n = get("POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 11\r\n\r\n"
             "hello world",
             rsp, sizeof(rsp));
@@ -432,7 +434,7 @@ static void test_integration(void)
     CHECK(strncmp(rsp, "HTTP/1.1 200", 12) == 0);
     CHECK(strstr(rsp, "\r\n\r\nhello world") != NULL);
 
-    /* 15) Body mit NUL-Byte (muss ueber die Laenge, nicht strlen, laufen) */
+    /* 15) body with a NUL byte (must go by length, not strlen) */
     {
         static const char head[] =
             "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\n\r\n";
@@ -443,62 +445,304 @@ static void test_integration(void)
         n = raw_request(g_port, body_req, reqlen, rsp, sizeof(rsp));
         CHECK(n > 0);
         CHECK(strncmp(rsp, "HTTP/1.1 200", 12) == 0);
-        /* Body im Response suchen (enthaelt NUL) */
+        /* find the body in the response (contains a NUL) */
         const char *body_start = strstr(rsp, "\r\n\r\n");
         CHECK(body_start != NULL);
         CHECK((size_t)(body_start + 9 - rsp) <= n);
         CHECK(memcmp(body_start + 4, "ab\0cd", 5) == 0);
     }
 
-    /* 16) abweichende doppelte Content-Length -> 400 */
+    /* 16) differing duplicate Content-Length -> 400 */
     n = get("POST /echo HTTP/1.1\r\nHost: t\r\n"
             "Content-Length: 5\r\nContent-Length: 6\r\n\r\nhello",
             rsp, sizeof(rsp));
     CHECK(n > 0);
     CHECK(strncmp(rsp, "HTTP/1.1 400", 12) == 0);
 
-    /* 17) identische doppelte Content-Length -> ok */
+    /* 17) identical duplicate Content-Length -> ok */
     n = get("POST /echo HTTP/1.1\r\nHost: t\r\n"
             "Content-Length: 5\r\nContent-Length: 5\r\n\r\nhello",
             rsp, sizeof(rsp));
     CHECK(n > 0);
     CHECK(strncmp(rsp, "HTTP/1.1 200", 12) == 0);
 
-    /* 18) Transfer-Encoding -> 501 (nicht unterstuetzt) */
+    /* 18) Transfer-Encoding -> 501 (unsupported) */
     n = get("POST /echo HTTP/1.1\r\nHost: t\r\n"
             "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
             rsp, sizeof(rsp));
     CHECK(n > 0);
     CHECK(strncmp(rsp, "HTTP/1.1 501", 12) == 0);
 
-    /* 19) Middleware-STOP: /private ohne Auth -> 401 */
+    /* 19) middleware STOP: /private without auth -> 401 */
     n = get("GET /private/x HTTP/1.1\r\nHost: t\r\n\r\n", rsp, sizeof(rsp));
     CHECK(n > 0);
     CHECK(strncmp(rsp, "HTTP/1.1 401", 12) == 0);
     CHECK(auth_mw_ran);
 
-    /* 20) Client haelt die Verbindung offen und sendet nichts ->
-     *     Server antwortet danach normal weiter (Timeout greift, aber
-     *     hier nur: danach ist der Server noch lebendig). */
+    /* 20) client holds the connection open and sends nothing ->
+     *     the server keeps answering afterwards (the timeout kicks in,
+     *     but here we only care that the server stays alive). */
     n = get("GET / HTTP/1.1\r\nHost: t\r\n\r\n", rsp, sizeof(rsp));
     CHECK(n > 0);
     CHECK(strncmp(rsp, "HTTP/1.1 200", 12) == 0);
 
-    /* Server sauber stoppen (das war vorher unmoeglich) */
+    /* stop the server cleanly (this was impossible before) */
     http_stop_server(&g_srv);
     CHECK(pthread_join(th, NULL) == 0);
     http_close_server(&g_srv);
 }
 
+/* ------------------------------------------------------------------ */
+/* static file tests                                                   */
+/* ------------------------------------------------------------------ */
+
+static int write_test_file(const char *path, const void *data, size_t len)
+{
+    FILE *f = fopen(path, "wb");
+    if (f == NULL) {
+        return -1;
+    }
+    size_t written = fwrite(data, 1, len, f);
+    fclose(f);
+    return written == len ? 0 : -1;
+}
+
+static void test_static_files(void)
+{
+    /* 1) build a temporary root directory with test files */
+    char www[128];
+    snprintf(www, sizeof(www), "/tmp/c_http_static_test_%ld", (long)getpid());
+    mkdir(www, 0755); /* leftover from a crash: fine */
+    char sub[160];
+    snprintf(sub, sizeof(sub), "%s/sub", www);
+    mkdir(sub, 0755);
+
+    char p[192];
+    snprintf(p, sizeof(p), "%s/index.html", www);
+    CHECK(write_test_file(p, "<h1>index</h1>", strlen("<h1>index</h1>")) == 0);
+    snprintf(p, sizeof(p), "%s/style.css", www);
+    CHECK(write_test_file(p, "body {}", 7) == 0);
+    snprintf(p, sizeof(p), "%s/sub/data.json", www);
+    CHECK(write_test_file(p, "[1,2,3]", 7) == 0);
+
+    /* > 4 KiB: deliberately larger than the body buffer (streaming path) */
+    static char big[8192];
+    memset(big, 'B', sizeof(big));
+    snprintf(p, sizeof(p), "%s/big.bin", www);
+    CHECK(write_test_file(p, big, sizeof(big)) == 0);
+
+    /* symlink pointing out of the root directory */
+    snprintf(p, sizeof(p), "%s/evil", www);
+    (void)symlink("/etc/passwd", p);
+
+    /* 2) set up server + mount */
+    bool created = false;
+    for (uint32_t port = TEST_PORT_START; port <= TEST_PORT_END; port++) {
+        ServerArgs args = {.port = (uint16_t)port,
+                           .bind_addr = "127.0.0.1",
+                           .server_name = "test"};
+        if (http_create_server(&args, &g_srv) == SERVER_OK) {
+            created = true;
+            break;
+        }
+    }
+    CHECK(created);
+    if (!created)
+        return;
+    g_port = g_srv.port;
+
+    CHECK(http_static_mount(&g_srv, &(HttpStaticConfig){
+                                        .prefix = "/static",
+                                        .root = www,
+                                        .index_file = "index.html",
+                                        .max_age = 60,
+                                    }) == SERVER_OK);
+
+    /* invalid mounts: duplicate / broken prefix / missing root */
+    CHECK(http_static_mount(&g_srv, &(HttpStaticConfig){
+                                        .prefix = "/static",
+                                        .root = www,
+                                    }) == SERVER_ERROR);
+    CHECK(http_static_mount(&g_srv, &(HttpStaticConfig){
+                                        .prefix = "/pct%2f",
+                                        .root = www,
+                                    }) == SERVER_ERROR);
+    CHECK(http_static_mount(&g_srv, &(HttpStaticConfig){
+                                        .prefix = "/other",
+                                        .root = "/does/not/exist",
+                                    }) == SERVER_ERROR);
+
+    /* exact route wins over the mount */
+    http_get(&g_srv, "/static/route.txt", h_root);
+
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, server_thread, NULL) == 0);
+    CHECK(wait_listening(g_port));
+    g_srv_ready = true;
+
+    char rsp[32 * 1024];
+    size_t n;
+
+    /* GET index: /static/ (empty suffix) -> index.html */
+    n = get("GET /static/ HTTP/1.1\r\nHost: t\r\n\r\n", rsp, sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 200", 12) == 0);
+    CHECK(strstr(rsp, "Content-Type: text/html") != NULL);
+    CHECK(strstr(rsp, "Cache-Control: public, max-age=60") != NULL);
+    CHECK(strstr(rsp, "\r\n\r\n<h1>index</h1>") != NULL);
+
+    /* GET without a trailing slash matches the mount too */
+    n = get("GET /static HTTP/1.1\r\nHost: t\r\n\r\n", rsp, sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 200", 12) == 0);
+
+    /* GET subdirectory + MIME type */
+    n = get("GET /static/sub/data.json HTTP/1.1\r\nHost: t\r\n\r\n", rsp,
+            sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 200", 12) == 0);
+    CHECK(strstr(rsp, "Content-Type: application/json") != NULL);
+    CHECK(strstr(rsp, "\r\n\r\n[1,2,3]") != NULL);
+
+    /* CSS MIME type + remember the ETag for the 304 test */
+    n = get("GET /static/style.css HTTP/1.1\r\nHost: t\r\n\r\n", rsp,
+            sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strstr(rsp, "Content-Type: text/css") != NULL);
+    char etag[64] = "";
+    const char *etag_pos = strstr(rsp, "ETag: ");
+    CHECK(etag_pos != NULL);
+    if (etag_pos != NULL) {
+        const char *eol = strstr(etag_pos, "\r\n");
+        CHECK(eol != NULL);
+        size_t elen = (size_t)(eol - (etag_pos + 6));
+        CHECK(elen < sizeof(etag));
+        memcpy(etag, etag_pos + 6, elen);
+        etag[elen] = '\0';
+    }
+
+    /* large file: streamed, exactly 8192 bytes, no truncation */
+    n = get("GET /static/big.bin HTTP/1.1\r\nHost: t\r\n\r\n", rsp,
+            sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 200", 12) == 0);
+    CHECK(strstr(rsp, "Content-Length: 8192") != NULL);
+    {
+        const char *body = strstr(rsp, "\r\n\r\n");
+        CHECK(body != NULL);
+        if (body != NULL) {
+            body += 4;
+            CHECK((size_t)(rsp + n - body) == 8192);
+            bool all_b = true;
+            for (size_t i = 0; i < 8192; i++) {
+                if (body[i] != 'B') {
+                    all_b = false;
+                    break;
+                }
+            }
+            CHECK(all_b);
+        }
+    }
+
+    /* HEAD on the large file: headers like GET, but no body */
+    n = get("HEAD /static/big.bin HTTP/1.1\r\nHost: t\r\n\r\n", rsp,
+            sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 200", 12) == 0);
+    CHECK(strstr(rsp, "Content-Length: 8192") != NULL);
+    CHECK(strcmp(rsp + strlen(rsp) - 4, "\r\n\r\n") == 0);
+
+    /* 404: missing file */
+    n = get("GET /static/nope.html HTTP/1.1\r\nHost: t\r\n\r\n", rsp,
+            sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 404", 12) == 0);
+
+    /* 404: raw traversal (..) */
+    n = get("GET /static/../secret HTTP/1.1\r\nHost: t\r\n\r\n", rsp,
+            sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 404", 12) == 0);
+
+    /* 404: URL-encoded traversal (%2e%2e) */
+    n = get("GET /static/%2e%2e%2f%2e%2e%2fetc%2fpasswd HTTP/1.1\r\n"
+            "Host: t\r\n\r\n",
+            rsp, sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 404", 12) == 0);
+
+    /* 400: NUL injection (%00) */
+    n = get("GET /static/%00x HTTP/1.1\r\nHost: t\r\n\r\n", rsp, sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 400", 12) == 0);
+
+    /* 404: symlink escape out of the root directory */
+    n = get("GET /static/evil HTTP/1.1\r\nHost: t\r\n\r\n", rsp, sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 404", 12) == 0);
+
+    /* 404: prefix boundary (/static-x is not part of the mount) */
+    n = get("GET /static-x HTTP/1.1\r\nHost: t\r\n\r\n", rsp, sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 404", 12) == 0);
+
+    /* 405: POST on a mounted file */
+    n = get("POST /static/style.css HTTP/1.1\r\nHost: t\r\n"
+            "Content-Length: 0\r\n\r\n",
+            rsp, sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 405", 12) == 0);
+    CHECK(strstr(rsp, "Allow: GET, HEAD") != NULL);
+
+    /* 304: If-None-Match with the ETag from the first response */
+    if (etag[0] != '\0') {
+        char req[256];
+        snprintf(req, sizeof(req),
+                 "GET /static/style.css HTTP/1.1\r\nHost: t\r\n"
+                 "If-None-Match: %s\r\n\r\n",
+                 etag);
+        n = get(req, rsp, sizeof(rsp));
+        CHECK(n > 0);
+        CHECK(strncmp(rsp, "HTTP/1.1 304", 12) == 0);
+        CHECK(strcmp(rsp + strlen(rsp) - 4, "\r\n\r\n") == 0);
+    }
+
+    /* exact route wins over the mount (body "ok", not file content) */
+    n = get("GET /static/route.txt HTTP/1.1\r\nHost: t\r\n\r\n", rsp,
+            sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 200", 12) == 0);
+    CHECK(strstr(rsp, "\r\n\r\nok") != NULL);
+
+    /* 3) tear down and remove the test files */
+    http_stop_server(&g_srv);
+    CHECK(pthread_join(th, NULL) == 0);
+    http_close_server(&g_srv);
+
+    snprintf(p, sizeof(p), "%s/evil", www);
+    unlink(p);
+    snprintf(p, sizeof(p), "%s/index.html", www);
+    unlink(p);
+    snprintf(p, sizeof(p), "%s/style.css", www);
+    unlink(p);
+    snprintf(p, sizeof(p), "%s/big.bin", www);
+    unlink(p);
+    snprintf(p, sizeof(p), "%s/sub/data.json", www);
+    unlink(p);
+    rmdir(sub);
+    rmdir(www);
+}
+
 int main(void)
 {
-    alarm(60); /* Watchdog: Test darf nicht haengen */
+    alarm(60); /* watchdog: the test must not hang */
 
     test_accepts_encoding();
     test_set_header_validation();
     test_route_limits();
     test_group_paths();
     test_integration();
+    test_static_files();
 
     return test_report();
 }
