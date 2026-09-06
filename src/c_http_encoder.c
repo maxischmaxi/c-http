@@ -180,9 +180,8 @@ bool http_encode_body(HttpServer *server, const HttpRequest *req,
     HTTP_ASSERT(req != NULL);
     HTTP_ASSERT(res != NULL);
     HTTP_ASSERT_MSG(res->body_len <= sizeof(res->body),
-                "body_len exceeds body buffer");
-    HTTP_ASSERT(server->encoders != NULL ||
-                server->encoder_count == 0);
+                    "body_len exceeds body buffer");
+    HTTP_ASSERT(server->encoders != NULL || server->encoder_count == 0);
 
     if (res->body_len == 0 || res->encoded_body != NULL) {
         return false;

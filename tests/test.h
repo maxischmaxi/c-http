@@ -8,13 +8,14 @@
 static int test_checks = 0;
 static int test_failures = 0;
 
-#define CHECK(cond)                                                                  \
-    do {                                                                             \
-        test_checks++;                                                               \
-        if (!(cond)) {                                                               \
-            test_failures++;                                                         \
-            fprintf(stderr, "%s:%d: CHECK(%s) failed\n", __FILE__, __LINE__, #cond); \
-        }                                                                            \
+#define CHECK(cond)                                                          \
+    do {                                                                     \
+        test_checks++;                                                       \
+        if (!(cond)) {                                                       \
+            test_failures++;                                                 \
+            fprintf(stderr, "%s:%d: CHECK(%s) failed\n", __FILE__, __LINE__, \
+                    #cond);                                                  \
+        }                                                                    \
     } while (0)
 
 static inline int test_report(void)

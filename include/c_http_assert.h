@@ -17,45 +17,45 @@
  */
 
 #ifdef NDEBUG
-  #define HTTP_ASSERT(cond) ((void)0)
-  #define HTTP_ASSERT_MSG(cond, msg) ((void)0)
+#define HTTP_ASSERT(cond)          ((void)0)
+#define HTTP_ASSERT_MSG(cond, msg) ((void)0)
 #else
-  #include <stdio.h>
-  #include <stdlib.h>
+#include <stdio.h>
+#include <stdlib.h>
 
-  #define HTTP_ASSERT(cond)                                              \
-    do {                                                                \
-      if (!(cond)) {                                                    \
-        fprintf(stderr,                                                 \
-                "\n=========================================="          \
-                "============\n"                                        \
-                "ASSERTION FAILED\n"                                    \
-                "  Condition: (%s)\n"                                   \
-                "  File:       %s:%d\n"                                 \
-                "  Function:   %s\n"                                    \
-                "======================================================" \
-                "\n\n",                                                  \
-                #cond, __FILE__, __LINE__, __func__);                    \
-        abort();                                                        \
-      }                                                                 \
+#define HTTP_ASSERT(cond)                                                    \
+    do {                                                                     \
+        if (!(cond)) {                                                       \
+            fprintf(stderr,                                                  \
+                    "\n=========================================="           \
+                    "============\n"                                         \
+                    "ASSERTION FAILED\n"                                     \
+                    "  Condition: (%s)\n"                                    \
+                    "  File:       %s:%d\n"                                  \
+                    "  Function:   %s\n"                                     \
+                    "======================================================" \
+                    "\n\n",                                                  \
+                    #cond, __FILE__, __LINE__, __func__);                    \
+            abort();                                                         \
+        }                                                                    \
     } while (0)
 
-  #define HTTP_ASSERT_MSG(cond, msg)                                     \
-    do {                                                                 \
-      if (!(cond)) {                                                     \
-        fprintf(stderr,                                                  \
-                "\n=========================================="           \
-                "============\n"                                         \
-                "ASSERTION FAILED\n"                                     \
-                "  Condition: (%s)\n"                                    \
-                "  Message:   %s\n"                                      \
-                "  File:       %s:%d\n"                                  \
-                "  Function:   %s\n"                                     \
-                "======================================================"  \
-                "\n\n",                                                  \
-                #cond, (msg), __FILE__, __LINE__, __func__);              \
-        abort();                                                         \
-      }                                                                  \
+#define HTTP_ASSERT_MSG(cond, msg)                                           \
+    do {                                                                     \
+        if (!(cond)) {                                                       \
+            fprintf(stderr,                                                  \
+                    "\n=========================================="           \
+                    "============\n"                                         \
+                    "ASSERTION FAILED\n"                                     \
+                    "  Condition: (%s)\n"                                    \
+                    "  Message:   %s\n"                                      \
+                    "  File:       %s:%d\n"                                  \
+                    "  Function:   %s\n"                                     \
+                    "======================================================" \
+                    "\n\n",                                                  \
+                    #cond, (msg), __FILE__, __LINE__, __func__);             \
+            abort();                                                         \
+        }                                                                    \
     } while (0)
 #endif
 

@@ -248,8 +248,7 @@ typedef enum {
 
 typedef struct {
     const char *name;
-    int (*encode)(const char *in, size_t in_len,
-                 char **out, size_t *out_len);
+    int (*encode)(const char *in, size_t in_len, char **out, size_t *out_len);
 } HttpEncoder;
 
 typedef struct {

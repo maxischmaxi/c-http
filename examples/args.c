@@ -1,10 +1,11 @@
 #include "args.h"
-#include "c_http_assert.h"
 
 #include <cargs.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+#include "c_http_assert.h"
 
 static struct cag_option options[] = {
     {
