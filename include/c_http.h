@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define C_HTTP_VERSION "0.3.0"
+#define C_HTTP_VERSION "0.5.0"
 
 #define HTTP_ROUTE_INITIAL_CAP 8
 

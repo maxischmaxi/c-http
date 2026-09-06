@@ -66,25 +66,25 @@ target_link_libraries(my-app PRIVATE c_http::c_http)
 
 ## Features
 
-| Feature                              | Status |
-| ------------------------------------ | ------ |
-| HTTP/1.1 request parsing             | ✅     |
-| All 9 HTTP methods                   | ✅     |
-| All 62 HTTP status codes             | ✅     |
-| Dynamic route array                  | ✅     |
-| Middleware with path matching        | ✅     |
-| Middleware abort (short-circuit)     | ✅     |
-| Dynamic headers (request + response) | ✅     |
-| gzip content encoding (default)      | ✅     |
-| Request body (`Content-Length`)       | ✅     |
-| Accept-Encoding q-values (RFC 9110)   | ✅     |
-| Custom encoder plugin system          | ✅     |
-| Static file serving (`http_static_mount`) | ✅ |
-| File streaming (`res->file_path`)      | ✅     |
-| Graceful shutdown (`http_stop_server`)| ✅     |
-| Slowloris protection (socket timeout) | ✅     |
-| HTTP spec asserts (debug builds)     | ✅     |
-| Single-header amalgamation           | ✅     |
+| Feature                                   | Status |
+| ----------------------------------------- | ------ |
+| HTTP/1.1 request parsing                  | ✅     |
+| All 9 HTTP methods                        | ✅     |
+| All 62 HTTP status codes                  | ✅     |
+| Dynamic route array                       | ✅     |
+| Middleware with path matching             | ✅     |
+| Middleware abort (short-circuit)          | ✅     |
+| Dynamic headers (request + response)      | ✅     |
+| gzip content encoding (default)           | ✅     |
+| Request body (`Content-Length`)           | ✅     |
+| Accept-Encoding q-values (RFC 9110)       | ✅     |
+| Custom encoder plugin system              | ✅     |
+| Static file serving (`http_static_mount`) | ✅     |
+| File streaming (`res->file_path`)         | ✅     |
+| Graceful shutdown (`http_stop_server`)    | ✅     |
+| Slowloris protection (socket timeout)     | ✅     |
+| HTTP spec asserts (debug builds)          | ✅     |
+| Single-header amalgamation                | ✅     |
 
 Responses follow HTTP/1.1: correct status codes (`400/405/413/414/431/501/505`
 instead of silent 404s for malformed requests), `HEAD` falls back to `GET`
@@ -108,7 +108,7 @@ cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
 Defined in [`include/c_http.h`](include/c_http.h):
 
 ```c
-#define C_HTTP_VERSION "0.3.0"
+#define C_HTTP_VERSION "0.5.0"
 ```
 
 ## Project structure

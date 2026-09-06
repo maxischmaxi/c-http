@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 project(c-http
-  VERSION 0.3.0
+  VERSION 0.5.0
   LANGUAGES C
   DESCRIPTION "A minimal HTTP server library in C"
 )
