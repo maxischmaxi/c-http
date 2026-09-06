@@ -28,13 +28,17 @@ static void home_post_handler(const HttpRequest *req, HttpResponse *res)
     res->body_len = sizeof(body) - 1;
 }
 
-static void cors_middleware(const HttpRequest *req, HttpResponse *res)
+static HttpMiddlewareResult cors_middleware(const HttpRequest *req,
+                                            HttpResponse *res)
 {
+    http_set_header(&res->headers, HTTP_HEADER_ACCESS_CONTROL_ALLOW_ORIGIN,
+                    "http://localhost:8080");
     (void)req;
-    (void)res;
+    res->status = 500;
     // res->status = 200;
     // memcpy(res->body, body, sizeof(body) - 1);
     // res->body_len = sizeof(body) - 1;
+    return HTTP_MIDDLEWARE_CONTINUE;
 }
 
 int main(int argc, char **argv)
@@ -51,16 +55,17 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    ServerArgs server_args = {
-        .bind_addr = args.bind_addr,
-        .port = args.port,
-    };
+    ServerArgs server_args = {.bind_addr = args.bind_addr,
+                              .port = args.port,
+                              .server_name = "MaxServer"};
 
     HttpServer server;
     if (http_create_server(&server_args, &server) == SERVER_ERROR) {
         fprintf(stderr, "failed to create server\n");
         return 1;
     }
+
+    http_register_encoder(&server, http_gzip_encoder);
 
     if (http_middleware(&server, NULL, cors_middleware) !=
         HTTP_MIDDLEWARE_ADD_OK) {

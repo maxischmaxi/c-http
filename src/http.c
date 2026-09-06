@@ -8,11 +8,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
-
-#define HTTP_ROUTE_INITIAL_CAP 8
 
 static const char *status_text(int status)
 {
@@ -155,7 +155,76 @@ static const char *status_text(int status)
     }
 }
 
-static int string_to_protocol(const char *method, HttpMethod *out)
+static bool path_matches(const char *mid_path, const char *req_path)
+{
+    size_t mid_len = strlen(mid_path);
+    size_t req_len = strlen(req_path);
+
+    if (mid_len > req_len) {
+        return false;
+    }
+
+    if (strncmp(mid_path, req_path, mid_len) != 0) {
+        return false;
+    }
+
+    if (mid_len == req_len) {
+        return true;
+    }
+
+    /*
+     * Prefix stimmt, jetzt Boundary-Check:
+     *
+     * Fall 1: Middleware-Pfad endet mit '/'
+     *   "/"         -> matcht alles (root)
+     *   "/api/"     -> matcht "/api/users"
+     *   -> kein weiterer Check nötig, '/' ist bereits die Grenze
+     */
+    if (mid_path[mid_len - 1] == '/') {
+        return true;
+    }
+
+    /*
+     * Fall 2: Middleware-Pfad endet NICHT mit '/'
+     *   "/api" matcht "/api/users" (nächstes Zeichen ist '/')
+     *   "/api" matcht NICHT "/api-v2" (nächstes Zeichen ist '-')
+     */
+    return req_path[mid_len] == '/';
+}
+
+static int apply_header(HttpHeaders *headers, const char *key,
+                        const char *value)
+{
+    if (headers == NULL) {
+        return -1;
+    }
+
+    if (headers->count == headers->capacity) {
+        size_t new_cap = headers->capacity == 0 ? 8 : headers->capacity * 2;
+        HttpHeader *tmp = realloc(headers->items, new_cap * sizeof(HttpHeader));
+        if (!tmp) {
+            return -1;
+        }
+        headers->items = tmp;
+        headers->capacity = new_cap;
+    }
+
+    headers->items[headers->count] = (HttpHeader){
+        .key = strdup(key),
+        .value = strdup(value),
+    };
+    if (!headers->items[headers->count].key ||
+        !headers->items[headers->count].value) {
+        free(headers->items[headers->count].key);
+        free(headers->items[headers->count].value);
+        return -1;
+    }
+
+    headers->count++;
+    return 0;
+}
+
+static int string_to_http_method(const char *method, HttpMethod *out)
 {
     if (method == NULL || out == NULL) {
         return -1;
@@ -225,6 +294,151 @@ static int send_all(int client_fd, const char *data, size_t len)
     return 0;
 }
 
+static void send_res(HttpResponse *res, int client_fd)
+{
+    size_t body_len =
+        res->encoded_body != NULL ? res->encoded_body_len : res->body_len;
+    const char *body =
+        res->encoded_body != NULL ? res->encoded_body : res->body;
+
+    char status_line[64];
+    int status_len =
+        snprintf(status_line, sizeof(status_line), "HTTP/1.1 %d %s\r\n",
+                 res->status, status_text(res->status));
+    send_all(client_fd, status_line, (size_t)status_len);
+
+    char content_length[32];
+    int cl_len = snprintf(content_length, sizeof(content_length),
+                          "Content-Length: %zu\r\n", body_len);
+    send_all(client_fd, content_length, (size_t)cl_len);
+
+    bool has_content_type = false;
+    for (size_t i = 0; i < res->headers.count; i++) {
+        if (strcasecmp(res->headers.items[i].key, "Content-Type") == 0) {
+            has_content_type = true;
+            break;
+        }
+    }
+
+    if (!has_content_type && body_len > 0) {
+        send_all(client_fd, "Content-Type: text/html\r\n", 24);
+    }
+
+    for (size_t i = 0; i < res->headers.count; i++) {
+        char hdr_line[512];
+        int hl =
+            snprintf(hdr_line, sizeof(hdr_line), "%s: %s\r\n",
+                     res->headers.items[i].key, res->headers.items[i].value);
+        send_all(client_fd, hdr_line, (size_t)hl);
+    }
+
+    send_all(client_fd, "\r\n", 2);
+    send_all(client_fd, body, body_len);
+
+    if (res->encoded_body != NULL) {
+        free(res->encoded_body);
+        res->encoded_body = NULL;
+    }
+}
+
+static void parse_headers(char buf[4096], ssize_t total, HttpRequest *req)
+{
+
+    /* --- Header parsing --- */
+    /* buf sieht so aus:
+     *   GET /path HTTP/1.1 CRLF Host: example.com CRLF Accept: text/html CRLF
+     * CRLF
+     *   ^-- Request-Line -^  ^-- Header-Zeilen -----------------------^ ^--
+     * Ende */
+    char *cursor = strstr(buf, "\r\n"); /* Ende der Request-Line */
+    if (cursor) {
+        cursor += 2; /* CRLF ueberspringen - Start der ersten Header-Zeile */
+
+        while (cursor < buf + total && cursor[0] != '\r') {
+            /* Zeilenende suchen */
+            char *line_end = strstr(cursor, "\r\n");
+            if (!line_end) {
+                break; /* unvollstaendige Zeile -> abbrechen */
+            }
+
+            /* Doppelpunkt suchen (Key:Value-Trenner) */
+            char *colon = memchr(cursor, ':', (size_t)(line_end - cursor));
+            if (!colon) {
+                /* malformierte Zeile ohne ':' -> ueberspringen */
+                cursor = line_end + 2;
+                continue;
+            }
+
+            /* Key: in-place null-terminieren */
+            *colon = '\0';
+            char *key = cursor;
+
+            /* Value: nach ':' starten, fuehrende Leerzeichen/Tabulatoren
+             * trimmen */
+            char *value = colon + 1;
+            while (*value == ' ' || *value == '\t') {
+                value++;
+            }
+
+            /* Value am Zeilenende null-terminieren */
+            *line_end = '\0';
+
+            apply_header(&req->headers, key, value);
+
+            cursor = line_end + 2; /* naechste Zeile */
+        }
+    }
+}
+
+static bool apply_middleware(HttpServer *server, HttpRequest *req,
+                             HttpResponse *res)
+{
+    for (size_t i = 0; i < server->middleware_count; i++) {
+        HttpMiddlewareHandler middleware = server->middlewares[i].handler;
+        const char *mid_path = server->middlewares[i].path;
+
+        if (mid_path == NULL) {
+            if (middleware(req, res) == HTTP_MIDDLEWARE_STOP) {
+                return false;
+            }
+            continue;
+        }
+
+        if (path_matches(mid_path, req->path)) {
+            if (middleware(req, res) == HTTP_MIDDLEWARE_STOP) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static int execute_handler(HttpServer *server, HttpRequest *req,
+                           HttpResponse *res)
+{
+    HttpHandler handler = NULL;
+    for (size_t i = 0; i < server->route_count; i++) {
+        HttpMethod m;
+        if (string_to_http_method(req->method, &m) != 0) {
+            continue;
+        }
+        if (m != server->routes[i].method) {
+            continue;
+        }
+        if (strcmp(req->path, server->routes[i].path) == 0) {
+            handler = server->routes[i].handler;
+            break;
+        }
+    }
+
+    if (handler == NULL) {
+        return -1;
+    }
+
+    handler(req, res);
+    return 0;
+}
+
 static void handle_client(HttpServer *server, int client_fd, const char *ip,
                           uint16_t client_port)
 {
@@ -243,72 +457,59 @@ static void handle_client(HttpServer *server, int client_fd, const char *ip,
     HttpRequest req = {0};
     HttpResponse res = {0};
 
+    char time_buf[64];
+    time_t now = time(NULL);
+    struct tm gt;
+    gmtime_r(&now, &gt);
+    strftime(time_buf, sizeof time_buf, "%a, %d %b %Y %H:%M:%S GMT", &gt);
+    apply_header(&res.headers, HTTP_HEADER_DATE, time_buf);
+    apply_header(&res.headers, HTTP_HEADER_CONTENT_TYPE,
+                 "text/html; charset=utf-8");
+    apply_header(&res.headers, HTTP_HEADER_CONNECTION, "close");
+    char server_name[64];
+    snprintf(server_name, sizeof(server_name), "%s/%s", server->server_name,
+             C_HTTP_VERSION);
+    apply_header(&res.headers, HTTP_HEADER_SERVER, server_name);
+    apply_header(&res.headers, HTTP_HEADER_STRICT_TRANSPORT_SECURITY,
+                 "max-age=31536000; includeSubDomains");
+    apply_header(&res.headers, HTTP_HEADER_X_CONTENT_TYPE_OPTIONS, "nosniff");
+    apply_header(&res.headers, HTTP_HEADER_X_FRAME_OPTIONS, "SAMEORIGIN");
+    apply_header(&res.headers, HTTP_HEADER_CONTENT_SECURITY_POLICY,
+                 "default-src 'self'");
+    apply_header(&res.headers, HTTP_HEADER_REFERER_POLICY,
+                 "strict-origin-when-cross-origin");
+    apply_header(&res.headers, HTTP_HEADER_PERMISSIONS_POLICY,
+                 "geolocation=(), camera=(), microphone=()");
+    apply_header(&res.headers, HTTP_HEADER_ACCEPT_RANGES, "bytes");
+    apply_header(&res.headers, HTTP_HEADER_VARY, HTTP_HEADER_ACCEPT_ENCODING);
+
     int fields =
         sscanf(buf, "%7s %511s %15s", req.method, req.path, req.version);
 
     if (fields != 3) {
-        const char *bad = "HTTP/1.1 400 Bad Request\r\n"
-                          "Content-Length: 0\r\n"
-                          "Connection: close\r\n"
-                          "\r\n";
-        send_all(client_fd, bad, strlen(bad));
+        res.status = 400;
         return;
-    }
-
-    for (size_t i = 0; i < server->middleware_count; i++) {
-        HttpMiddlewareHandler middleware = server->middlewares[i].handler;
-        if (server->middlewares[i].path == NULL) {
-            middleware(&req, &res);
-            continue;
-        }
-
-        // TODO: path matching, only execute a middleware that is a parent or
-        // the exact same route
-    }
-
-    HttpHandler handler = NULL;
-    for (size_t i = 0; i < server->route_count; i++) {
-        HttpMethod m;
-        if (string_to_protocol(req.method, &m) != 0) {
-            continue;
-        }
-        if (m != server->routes[i].method) {
-            continue;
-        }
-        if (strcmp(req.path, server->routes[i].path) == 0) {
-            handler = server->routes[i].handler;
-            break;
-        }
-    }
-
-    if (handler != NULL) {
-        handler(&req, &res);
-    } else {
-        res.status = 404;
-    }
-
-    if (res.status == 0) {
-        res.status = 500;
     }
 
     printf("%s:%u %s %s -> %d\n", ip, client_port, req.method, req.path,
            res.status);
 
-    char header[256];
-    int header_len =
-        snprintf(header, sizeof(header),
-                 "HTTP/1.1 %d %s\r\n"
-                 "Content-Type: text/html\r\n"
-                 "Content-Length: %zu\r\n"
-                 "Connection: close\r\n"
-                 "\r\n",
-                 res.status, status_text(res.status), res.body_len);
-
-    if (header_len < 0 || (size_t)header_len >= sizeof(header) ||
-        send_all(client_fd, header, (size_t)header_len) < 0 ||
-        send_all(client_fd, res.body, res.body_len) < 0) {
-        perror("send");
+    parse_headers(buf, total, &req);
+    if (apply_middleware(server, &req, &res)) {
+        if (execute_handler(server, &req, &res) != 0) {
+            res.status = HTTP_STATUS_NOT_FOUND;
+        }
     }
+
+    if (res.status == 0) {
+        res.status = HTTP_STATUS_INTERNAL_SERVER_ERROR;
+    }
+
+    http_encode_body(server, &req, &res);
+
+    send_res(&res, client_fd);
+    http_headers_free(&res.headers);
+    http_headers_free(&req.headers);
 }
 
 HttpServerResult http_create_server(const ServerArgs *server_args,
@@ -369,10 +570,21 @@ HttpServerResult http_create_server(const ServerArgs *server_args,
         return SERVER_ERROR;
     }
 
+    out->middlewares = NULL;
+    out->middleware_count = 0;
+    out->middleware_capacity = 0;
+
+    out->encoders = NULL;
+    out->encoder_count = 0;
+    out->encoder_capacity = 0;
+    http_register_encoder(out, http_gzip_encoder);
+    http_register_encoder(out, http_identity_encoder);
+
     out->port = server_args->port;
     out->bind_addr = server_args->bind_addr;
     out->listening = false;
     out->fd = server_fd;
+    out->server_name = server_args->server_name;
     return SERVER_OK;
 }
 
@@ -384,6 +596,14 @@ void http_close_server(HttpServer *server)
     free(server->routes);
     server->routes = NULL;
     server->route_count = server->route_capacity = 0;
+
+    free(server->middlewares);
+    server->middlewares = NULL;
+    server->middleware_count = server->middleware_capacity = 0;
+
+    free(server->encoders);
+    server->encoders = NULL;
+    server->encoder_count = server->encoder_capacity = 0;
 }
 
 void http_listen(HttpServer *server)
@@ -495,7 +715,9 @@ HttpMiddlewareAddResult http_middleware(HttpServer *server, const char *path,
                                         HttpMiddlewareHandler handler)
 {
     if (server->middleware_count == server->middleware_capacity) {
-        size_t new_cap = server->middleware_capacity * 2;
+        size_t new_cap = server->middleware_capacity == 0
+                             ? 8
+                             : server->middleware_capacity * 2;
         HttpMiddleware *tmp =
             realloc(server->middlewares, new_cap * sizeof(HttpMiddleware));
         if (!tmp) {
@@ -505,8 +727,17 @@ HttpMiddlewareAddResult http_middleware(HttpServer *server, const char *path,
         server->middleware_capacity = new_cap;
     }
 
-    server->routes[server->route_count++] =
-        (HttpRoute){.path = path, .handler = handler};
+    server->middlewares[server->middleware_count++] =
+        (HttpMiddleware){.path = path, .handler = handler};
 
     return HTTP_MIDDLEWARE_ADD_OK;
+}
+
+HttpSetHeaderResult http_set_header(HttpHeaders *headers, char *key,
+                                    char *value)
+{
+    if (apply_header(headers, key, value) < 0) {
+        return HTTP_SET_HEADER_ERROR;
+    }
+    return HTTP_SET_HEADER_OK;
 }

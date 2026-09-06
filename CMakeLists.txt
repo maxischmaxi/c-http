@@ -38,10 +38,16 @@ function(c_http_add_executable target)
 endfunction()
 
 # ---------------------------------------------------------------------------
+# dependencies: zlib for gzip encoding
+# ---------------------------------------------------------------------------
+find_package(ZLIB REQUIRED)
+
+# ---------------------------------------------------------------------------
 # targets
 # ---------------------------------------------------------------------------
-c_http_add_executable(c-http src/main.c src/args.c src/http.c)
-target_link_libraries(c-http PRIVATE cargs)
+c_http_add_executable(c-http src/main.c src/args.c src/http.c
+                       src/http_encoder.c)
+target_link_libraries(c-http PRIVATE cargs ZLIB::ZLIB)
 # vendor headers are SYSTEM includes: their warnings are not ours
 target_include_directories(c-http SYSTEM PRIVATE vendor/cargs/include)
 

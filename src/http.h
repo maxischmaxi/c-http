@@ -5,6 +5,130 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define C_HTTP_VERSION "0.1.0"
+
+#define HTTP_ROUTE_INITIAL_CAP 8
+
+#define HTTP_HEADER_A_IM            "A-IM"
+#define HTTP_HEADER_ACCEPT          "Accept"
+#define HTTP_HEADER_ACCEPT_CHARSET  "Accept-Charset"
+#define HTTP_HEADER_ACCEPT_DATETIME "Accept-Datetime"
+#define HTTP_HEADER_ACCEPT_ENCODING "Accept-Encoding"
+#define HTTP_HEADER_ACCEPT_LANGUAGE "Accept-Language"
+#define HTTP_HEADER_ACCESS_CONTROL_REQUEST_METHOD \
+    "Access-Control-Request-Method"
+#define HTTP_HEADER_ACCESS_CONTROL_REQUEST_HEADERS \
+    "Access-Control-Request-Headers"
+#define HTTP_HEADER_AUTHORIZATION       "Authorization"
+#define HTTP_HEADER_CACHE_CONTROL       "Cache-Control"
+#define HTTP_HEADER_CONNECTION          "Connection"
+#define HTTP_HEADER_CONTENT_DIGEST      "Content-Digest"
+#define HTTP_HEADER_CONTENT_ENCODING    "Content-Encoding"
+#define HTTP_HEADER_CONTENT_LENGTH      "Content-Length"
+#define HTTP_HEADER_CONTENT_MD5         "Content-MD5"
+#define HTTP_HEADER_CONTENT_TYPE        "Content-Type"
+#define HTTP_HEADER_COOKIE              "Cookie"
+#define HTTP_HEADER_DATE                "Date"
+#define HTTP_HEADER_EXPECT              "Expect"
+#define HTTP_HEADER_FORWARDED           "Forwarded"
+#define HTTP_HEADER_FROM                "From"
+#define HTTP_HEADER_HOST                "Host"
+#define HTTP_HEADER_HTTP2_SETTINGS      "HTTP2-Settings"
+#define HTTP_HEADER_IF_MATCH            "If-Match"
+#define HTTP_HEADER_IF_MODIFIED_SINCE   "If-Modified-Since"
+#define HTTP_HEADER_IF_NONE_MATCH       "If-None-Match"
+#define HTTP_HEADER_IF_RANGE            "If-Range"
+#define HTTP_HEADER_IF_UNMODIFIED_SINCE "If-Unmodified-Since"
+#define HTTP_HEADER_MAX_FORWARDS        "Max-Forwards"
+#define HTTP_HEADER_ORIGIN              "Origin"
+#define HTTP_HEADER_PRAGMA              "Pragma"
+#define HTTP_HEADER_PREFER              "Prefer"
+#define HTTP_HEADER_PROXY_AUTHORIZATION "Proxy-Authorization"
+#define HTTP_HEADER_RANGE               "Range"
+#define HTTP_HEADER_REFERER             "Referer"
+#define HTTP_HEADER_REFERER_POLICY      "Referer-Policy"
+#define HTTP_HEADER_TE                  "TE"
+#define HTTP_HEADER_TRAILER             "Trailer"
+#define HTTP_HEADER_TRANSFER_ENCODING   "Transfer-Encoding"
+#define HTTP_HEADER_USER_AGENT          "User-Agent"
+#define HTTP_HEADER_UPGRADE             "Upgrade"
+#define HTTP_HEADER_VIA                 "Via"
+#define HTTP_HEADER_WARNING             "Warning"
+
+#define HTTP_HEADER_ACCEPT_CH                   "Accept-CH"
+#define HTTP_HEADER_ACCESS_CONTROL_ALLOW_ORIGIN "Access-Control-Allow-Origin"
+#define HTTP_HEADER_ACCESS_CONTROL_ALLOW_CREDENTIALS \
+    "Access-Control-Allow-Credentials"
+#define HTTP_HEADER_ACCESS_CONTROL_EXPOSE_HEADERS \
+    "Access-Control-Expose-Headers"
+#define HTTP_HEADER_ACCESS_CONTROL_MAX_AGE       "Access-Control-Max-Age"
+#define HTTP_HEADER_ACCESS_CONTROL_ALLOW_METHODS "Access-Control-Allow-Methods"
+#define HTTP_HEADER_ACCESS_CONTROL_ALLOW_HEADERS "Access-Control-Allow-Headers"
+#define HTTP_HEADER_ACCEPT_PATCH                 "Accept-Patch"
+#define HTTP_HEADER_ACCEPT_RANGES                "Accept-Ranges"
+#define HTTP_HEADER_AGE                          "Age"
+#define HTTP_HEADER_ALLOW                        "Allow"
+#define HTTP_HEADER_ALT_SVC                      "Alt-Svc"
+#define HTTP_HEADER_CONTENT_DISPOSITION          "Content-Disposition"
+#define HTTP_HEADER_CONTENT_LANGUAGE             "Content-Language"
+#define HTTP_HEADER_CONTENT_LOCATION             "Content-Location"
+#define HTTP_HEADER_CONTENT_RANGE                "Content-Range"
+#define HTTP_HEADER_DELTA_BASE                   "Delta-Base"
+#define HTTP_HEADER_ETAG                         "ETag"
+#define HTTP_HEADER_EXPIRES                      "Expires"
+#define HTTP_HEADER_IM                           "IM"
+#define HTTP_HEADER_LAST_MODIFIED                "Last-Modified"
+#define HTTP_HEADER_LINK                         "Link"
+#define HTTP_HEADER_LOCATION                     "Location"
+#define HTTP_HEADER_P3P                          "P3P"
+#define HTTP_HEADER_PREFERENCE_APPLIED           "Preference-Applied"
+#define HTTP_HEADER_PROXY_AUTHENTICATE           "Proxy-Authenticate"
+#define HTTP_HEADER_PUBLIC_KEY_PINS              "Public-Key-Pins"
+#define HTTP_HEADER_RETRY_AFTER                  "Retry-After"
+#define HTTP_HEADER_SERVER                       "Server"
+#define HTTP_HEADER_SET_COOKIE                   "Set-Cookie"
+#define HTTP_HEADER_STRICT_TRANSPORT_SECURITY    "Strict-Transport-Security"
+#define HTTP_HEADER_TK                           "Tk"
+#define HTTP_HEADER_VARY                         "Vary"
+#define HTTP_HEADER_WWW_AUTHENTICATE             "WWW-Authenticate"
+#define HTTP_HEADER_X_FRAME_OPTIONS              "X-Frame-Options"
+
+#define HTTP_HEADER_UPGRADE_INSECURE_REQUESTS "Upgrade-Insecure-Requests"
+#define HTTP_HEADER_X_REQUESTED_WITH          "X-Requested-With"
+#define HTTP_HEADER_DNT                       "DNT"
+#define HTTP_HEADER_X_FORWARDED_FOR           "X-Forwarded-For"
+#define HTTP_HEADER_X_FORWARDED_HOST          "X-Forwarded-Host"
+#define HTTP_HEADER_X_FORWARDED_PROTO         "X-Forwarded-Proto"
+#define HTTP_HEADER_FRONT_END_HTTPS           "Front-End-Https"
+#define HTTP_HEADER_X_HTTP_METHOD_OVERRIDE    "X-HTTP-Method-Override"
+#define HTTP_HEADER_X_ATT_DEVICEID            "X-ATT-DeviceId"
+#define HTTP_HEADER_X_WAP_PROFILE             "X-Wap-Profile"
+#define HTTP_HEADER_PROXY_CONNECTION          "Proxy-Connection"
+#define HTTP_HEADER_X_UIDH                    "X-UIDH"
+#define HTTP_HEADER_X_CSRF_TOKEN              "X-Csrf-Token"
+#define HTTP_HEADER_X_REQUEST_ID              "X-Request-ID"
+#define HTTP_HEADER_X_CORRELATION_ID          "X-Correlation-ID"
+#define HTTP_HEADER_CORRELATION_ID            "Correlation-ID"
+#define HTTP_HEADER_SAVE_DATA                 "Save-Data"
+#define HTTP_HEADER_SEC_GPC                   "Sec-GPC"
+
+#define HTTP_HEADER_CONTENT_SECURITY_POLICY   "Content-Security-Policy"
+#define HTTP_HEADER_X_CONTENT_SECURITY_POLICY "X-Content-Security-Policy"
+#define HTTP_HEADER_X_WEBKIT_CSP              "X-WebKit-CSP"
+#define HTTP_HEADER_EXPECT_CT                 "Expect-CT"
+#define HTTP_HEADER_NEL                       "NEL"
+#define HTTP_HEADER_PERMISSIONS_POLICY        "Permissions-Policy"
+#define HTTP_HEADER_REFRESH                   "Refresh"
+#define HTTP_HEADER_REPORT_TO                 "Report-To"
+#define HTTP_HEADER_STATUS                    "Status"
+#define HTTP_HEADER_TIMING_ALLOW_ORIGIN       "Timing-Allow-Origin"
+#define HTTP_HEADER_X_CONTENT_DURATION        "X-Content-Duration"
+#define HTTP_HEADER_X_CONTENT_TYPE_OPTIONS    "X-Content-Type-Options"
+#define HTTP_HEADER_X_POWERED_BY              "X-Powered-By"
+#define HTTP_HEADER_X_REDIRECT_BY             "X-Redirect-By"
+#define HTTP_HEADER_X_UA_COMPATIBLE           "X-UA-Compatible"
+#define HTTP_HEADER_X_XSS_PROTECTION          "X-XSS-Protection"
+
 typedef enum {
     /* 1xx Informational */
     HTTP_STATUS_CONTINUE = 100,
@@ -91,6 +215,11 @@ typedef enum {
 } HttpRouteAddResult;
 
 typedef enum {
+    HTTP_MIDDLEWARE_CONTINUE,
+    HTTP_MIDDLEWARE_STOP,
+} HttpMiddlewareResult;
+
+typedef enum {
     HTTP_MIDDLEWARE_ADD_OK,
     HTTP_MIDDLEWARE_ADD_ERROR,
 } HttpMiddlewareAddResult;
@@ -107,26 +236,58 @@ typedef enum {
     HTTP_METHOD_TRACE,
 } HttpMethod;
 
+typedef enum {
+    HTTP_SET_HEADER_OK,
+    HTTP_SET_HEADER_ERROR,
+} HttpSetHeaderResult;
+
+typedef enum {
+    HTTP_ENCODER_ADD_OK,
+    HTTP_ENCODER_ADD_ERROR,
+} HttpEncoderAddResult;
+
+typedef struct {
+    const char *name;
+    int (*encode)(const char *in, size_t in_len,
+                 char **out, size_t *out_len);
+} HttpEncoder;
+
+typedef struct {
+    char *key;
+    char *value;
+} HttpHeader;
+
+typedef struct {
+    HttpHeader *items;
+    size_t count;
+    size_t capacity;
+} HttpHeaders;
+
 typedef struct {
     uint16_t port;
     const char *bind_addr;
+    char *server_name;
 } ServerArgs;
 
 typedef struct {
     char method[8];
     char path[512];
     char version[16];
+    HttpHeaders headers;
 } HttpRequest;
 
 typedef struct {
     int status;
     char body[4096];
     size_t body_len;
+    HttpHeaders headers;
+    char *encoded_body;
+    size_t encoded_body_len;
 } HttpResponse;
 
 typedef void (*HttpHandler)(const HttpRequest *req, HttpResponse *res);
-typedef void (*HttpMiddlewareHandler)(const HttpRequest *req,
-                                      HttpResponse *res);
+typedef HttpMiddlewareResult (*HttpMiddlewareHandler)(const HttpRequest *req,
+                                                      HttpResponse *res);
 
 typedef struct {
     const char *path;
@@ -150,6 +311,10 @@ typedef struct {
     HttpMiddleware *middlewares;
     size_t middleware_count;
     size_t middleware_capacity;
+    HttpEncoder *encoders;
+    size_t encoder_count;
+    size_t encoder_capacity;
+    char *server_name;
 } HttpServer;
 
 HttpServerResult http_create_server(const ServerArgs *server_args,
@@ -177,5 +342,17 @@ HttpRouteAddResult http_options(HttpServer *server, const char *path,
 
 HttpMiddlewareAddResult http_middleware(HttpServer *server, const char *path,
                                         HttpMiddlewareHandler handler);
+HttpSetHeaderResult http_set_header(HttpHeaders *headers, char *key,
+                                    char *value);
+
+HttpEncoderAddResult http_register_encoder(HttpServer *server,
+                                           HttpEncoder encoder);
+void http_headers_free(HttpHeaders *headers);
+bool http_accepts_encoding(const HttpRequest *req, const char *encoding);
+bool http_encode_body(HttpServer *server, const HttpRequest *req,
+                      HttpResponse *res);
+
+extern const HttpEncoder http_gzip_encoder;
+extern const HttpEncoder http_identity_encoder;
 
 #endif
