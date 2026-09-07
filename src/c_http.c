@@ -301,41 +301,175 @@ static const char *method_name(HttpMethod m)
     return "UNKNOWN";
 }
 
-static bool path_matches(const char *mid_path, const char *req_path)
+static bool parse_route_segments(const char *pattern, HttpRouteSegments *out)
 {
-    HTTP_ASSERT(mid_path != NULL);
-    HTTP_ASSERT(req_path != NULL);
+    HttpRouteSegments segments = {0};
+    segments.segments = malloc(8 * sizeof(HttpRouteSegment));
+    if (segments.segments == NULL) {
+        return false;
+    }
+    segments.count = 0;
+    segments.capacity = 8;
 
-    size_t mid_len = strlen(mid_path);
-    size_t req_len = strlen(req_path);
+    const char *p = pattern;
+    while ((p = strchr(p, '/')) != NULL) {
+        p++;
+
+        bool is_param = false;
+        if (*p == ':') {
+            is_param = true;
+            p++;
+        }
+
+        const char *end = p;
+        while (*end != '\0' && *end != '/') {
+            end++;
+        }
+
+        size_t len = (size_t)(end - p);
+        if (len == 0 && !is_param) {
+            continue;
+        }
+        if (len == 0) {
+            free(segments.segments);
+            return false;
+        }
+
+        if (len >= sizeof(segments.segments[0].text)) {
+            free(segments.segments);
+            return false;
+        }
+
+        HttpRouteSegment segment = {.is_param = is_param};
+        memcpy(segment.text, p, len);
+        segment.text[len] = '\0';
+        segments.segments[segments.count] = segment;
+        segments.count++;
+
+        if (segments.count == segments.capacity) {
+            size_t new_cap = segments.capacity * 2;
+            HttpRouteSegment *tmp =
+                realloc(segments.segments, new_cap * sizeof(HttpRouteSegment));
+            if (tmp == NULL) {
+                free(segments.segments);
+                return false;
+            }
+            segments.segments = tmp;
+            segments.capacity = new_cap;
+        }
+    }
+
+    out->segments = segments.segments;
+    out->count = segments.count;
+    out->capacity = segments.capacity;
+    return true;
+}
+
+/* Matches a parsed route pattern against parsed request segments.
+ * A ":name" segment binds any single non-empty request segment.
+ * If params is non-NULL AND the route matches, the bound values are
+ * copied into it (params->count is only set on a full match — a failed
+ * route attempt must not leave dirty state behind for the next route).
+ * Returns true = match, false = no match. */
+static bool segments_match(const HttpRouteSegments *pattern,
+                           const HttpRouteSegments *request, HttpParams *params)
+{
+    if (pattern == NULL || request == NULL) {
+        return false;
+    }
+    if (pattern->count != request->count) {
+        return false; /* different segment count -> clean "no match" */
+    }
+
+    size_t param_count = 0;
+    for (size_t i = 0; i < pattern->count; i++) {
+        const HttpRouteSegment *pat = &pattern->segments[i];
+        const HttpRouteSegment *cur = &request->segments[i];
+
+        if (pat->is_param) {
+            if (params == NULL) {
+                continue; /* pure match test — no binding wanted */
+            }
+            if (param_count >= HTTP_MAX_PARAMS) {
+                return false; /* registration rejects this earlier —
+                                 defensive bound against overflow */
+            }
+            HttpParam *param = &params->params[param_count];
+            if (snprintf(param->key, sizeof(param->key), "%s", pat->text) >=
+                (int)sizeof(param->key)) {
+                return false;
+            }
+            if (snprintf(param->value, sizeof(param->value), "%s", cur->text) >=
+                (int)sizeof(param->value)) {
+                return false;
+            }
+            param_count++;
+        } else if (strcmp(pat->text, cur->text) != 0) {
+            return false; /* literal mismatch -> "no match", NOT an error */
+        }
+    }
+
+    if (params != NULL) {
+        params->count = param_count; /* commit only on a full match */
+    }
+    return true;
+}
+
+/*
+ * the reg_path is the path that was registered in the code e.g. /api e.g. via
+ * http_get(&server, "/api", handle_api). The real_path is the path the e.g.
+ * browser requested via HTTP
+ */
+static bool path_matches(const char *reg_path, const char *real_path)
+{
+    HTTP_ASSERT(reg_path != NULL);
+    HTTP_ASSERT(real_path != NULL);
+
+    size_t reg_len = strlen(reg_path);
+    size_t real_len = strlen(real_path);
 
     /* Trailing slash on the middleware path is optional:
      * "/api/" behaves like "/api" (matches "/api" AND "/api/users").
      * "" matches everything (root). */
-    if (mid_len > 1 && mid_path[mid_len - 1] == '/') {
-        mid_len--;
+    if (reg_len > 1 && reg_path[reg_len - 1] == '/') {
+        reg_len--;
     }
-    if (mid_len == 0) {
+    if (reg_len == 0) {
         return true;
     }
-    if (req_len == 0) {
+    if (real_len == 0) {
         return false;
     }
 
-    if (strncmp(mid_path, req_path, mid_len) != 0) {
+    if (strncmp(reg_path, real_path, reg_len) != 0) {
         return false;
     }
 
-    if (req_len == mid_len) {
+    if (real_len == reg_len) {
+#ifndef NDEBUG
+        printf("match found, exact match: %s - %s\n", reg_path, real_path);
+#endif
         return true;
     }
 
-    if (mid_path[mid_len - 1] == '/') {
-        return true; /* "/" as a prefix matches everything below */
+    if (reg_path[reg_len - 1] == '/') {
+#ifndef NDEBUG
+        printf("match found, match without trailing slash: %s - %s\n", reg_path,
+               real_path);
+#endif
+        return true;
     }
 
     /* "/api" matches "/api/users", but NOT "/api-v2" */
-    return req_path[mid_len] == '/';
+    if (real_path[reg_len] == '/') {
+#ifndef NDEBUG
+        printf("match found, match with trailing slash: %s - %s\n", reg_path,
+               real_path);
+#endif
+        return true;
+    }
+
+    return false;
 }
 
 /* Compact RFC-1123-compliant date — deliberately NOT via strftime,
@@ -651,9 +785,12 @@ static void send_res(HttpResponse *res, int client_fd, bool suppress_body)
 
     if (!no_body_status) {
         char content_length[64]; /* large enough for any size_t */
+        size_t cl = body_len;
+        if (streaming) {
+            cl = (size_t)file_size;
+        }
         int cl_len = snprintf(content_length, sizeof(content_length),
-                              "Content-Length: %zu\r\n",
-                              streaming ? (size_t)file_size : body_len);
+                              "Content-Length: %zu\r\n", cl);
         if (cl_len < 0 || (size_t)cl_len >= sizeof(content_length)) {
             goto out;
         }
@@ -890,7 +1027,8 @@ static int read_body(int client_fd, char *buf, size_t total, size_t header_end,
     if (content_length < 0) {
         return 0; /* no body expected */
     }
-    if ((unsigned long long)content_length > HTTP_MAX_BODY) {
+    unsigned long long len = (unsigned long long)content_length;
+    if (len > HTTP_MAX_BODY) {
         return HTTP_STATUS_CONTENT_TOO_LARGE;
     }
 
@@ -963,9 +1101,10 @@ static void apply_default_headers(HttpResponse *res, HttpServer *server)
 static bool apply_middleware(HttpServer *server, HttpRequest *req,
                              HttpResponse *res)
 {
-    for (size_t i = 0; i < server->middleware_count; i++) {
-        HttpMiddlewareHandler middleware = server->middlewares[i].handler;
-        const char *mid_path = server->middlewares[i].path;
+    for (size_t i = 0; i < server->middlewares.count; i++) {
+        HttpMiddlewareHandler middleware =
+            server->middlewares.middlewares[i].handler;
+        const char *mid_path = server->middlewares.middlewares[i].path;
 
         if (mid_path == NULL) {
             if (middleware(req, res) == HTTP_MIDDLEWARE_STOP) {
@@ -991,44 +1130,52 @@ typedef enum {
 } HandlerResult;
 
 static HandlerResult execute_handler(HttpServer *server, HttpRequest *req,
-                                     HttpResponse *res)
+                                     HttpResponse *res,
+                                     const HttpRouteSegments *req_segments)
 {
-    HttpMethod m;
-    if (string_to_http_method(req->method, &m) != 0) {
+    HttpMethod method;
+    if (string_to_http_method(req->method, &method) != 0) {
         return HANDLER_NOT_IMPLEMENTED;
     }
 
     HttpHandler handler = NULL;
     bool path_exists = false;
 
-    for (size_t i = 0; i < server->route_count; i++) {
-        if (strcmp(req->path, server->routes[i].path) != 0) {
+    /* First match wins: with param routes, several routes can match the
+     * same request — registration order decides (Express semantics).
+     * Pass NULL: pure match test, params are bound only for the winner,
+     * so a failed attempt leaves req->params untouched. */
+    for (size_t i = 0; i < server->routes.count; i++) {
+        const HttpRoute *route = &server->routes.routes[i];
+        if (!segments_match(&route->route_segments, req_segments, NULL)) {
             continue;
         }
         path_exists = true;
-        if (server->routes[i].method == m) {
-            handler = server->routes[i].handler;
+        if (route->method == method) {
+            segments_match(&route->route_segments, req_segments, &req->params);
+            handler = route->handler;
             break;
         }
     }
 
     /* RFC 9110 §9.3.2: HEAD falls back to GET when no explicit HEAD
      * route exists (the body is suppressed at send time). */
-    if (handler == NULL && m == HTTP_METHOD_HEAD) {
-        for (size_t i = 0; i < server->route_count; i++) {
-            if (strcmp(req->path, server->routes[i].path) != 0) {
+    if (handler == NULL && method == HTTP_METHOD_HEAD) {
+        for (size_t i = 0; i < server->routes.count; i++) {
+            const HttpRoute *route = &server->routes.routes[i];
+            if (!segments_match(&route->route_segments, req_segments, NULL) ||
+                route->method != HTTP_METHOD_GET) {
                 continue;
             }
-            if (server->routes[i].method == HTTP_METHOD_GET) {
-                handler = server->routes[i].handler;
-                break;
-            }
+            segments_match(&route->route_segments, req_segments, &req->params);
+            handler = route->handler;
+            break;
         }
     }
 
     if (handler == NULL) {
-        /* No exact route: next, check the static file mounts
-         * (exact routes win over mounts). */
+        /* No route matched: next, check the static file mounts
+         * (routes win over mounts). */
         switch (http_static_dispatch(server, req, res)) {
         case HTTP_STATIC_SERVED:
             return HANDLER_OK;
@@ -1046,17 +1193,19 @@ static HandlerResult execute_handler(HttpServer *server, HttpRequest *req,
 }
 
 /* RFC 9110 §15.4.6: a 405 response includes an Allow header */
-static void set_allow_header(HttpServer *server, const char *path,
+static void set_allow_header(HttpServer *server,
+                             const HttpRouteSegments *req_segments,
                              HttpResponse *res)
 {
     char allow[128];
     size_t used = 0;
 
-    for (size_t i = 0; i < server->route_count; i++) {
-        if (strcmp(path, server->routes[i].path) != 0) {
+    for (size_t i = 0; i < server->routes.count; i++) {
+        if (!segments_match(&server->routes.routes[i].route_segments,
+                            req_segments, NULL)) {
             continue;
         }
-        const char *name = method_name(server->routes[i].method);
+        const char *name = method_name(server->routes.routes[i].method);
         size_t n = strlen(name);
         if (used > 0) {
             if (used + 2 + n >= sizeof(allow)) {
@@ -1081,7 +1230,7 @@ static void handle_client(HttpServer *server, int client_fd, const char *ip,
     HTTP_ASSERT(server != NULL);
     HTTP_ASSERT(client_fd >= 0);
     HTTP_ASSERT(ip != NULL);
-    HTTP_ASSERT(server->routes != NULL);
+    HTTP_ASSERT(server->routes.routes != NULL);
 
     char buf[4096];
     bool headers_complete = false;
@@ -1162,13 +1311,23 @@ static void handle_client(HttpServer *server, int client_fd, const char *ip,
     }
 #endif
 
+    /* Parse the request path into segments ONCE per request (routes
+     * carry their segments pre-parsed from registration time). A parse
+     * failure (bare ':' or an oversized segment) means no route can
+     * match — clean 404. */
+    HttpRouteSegments req_segments = {0};
+    bool req_segments_ok = parse_route_segments(req.path, &req_segments);
+
     if (apply_middleware(server, &req, &res)) {
-        switch (execute_handler(server, &req, &res)) {
+        HandlerResult result =
+            req_segments_ok ? execute_handler(server, &req, &res, &req_segments)
+                            : HANDLER_NOT_FOUND;
+        switch (result) {
         case HANDLER_OK:
             break;
         case HANDLER_METHOD_NOT_ALLOWED:
             res.status = HTTP_STATUS_METHOD_NOT_ALLOWED;
-            set_allow_header(server, req.path, &res);
+            set_allow_header(server, &req_segments, &res);
             break;
         case HANDLER_NOT_FOUND:
             res.status = HTTP_STATUS_NOT_FOUND;
@@ -1178,6 +1337,8 @@ static void handle_client(HttpServer *server, int client_fd, const char *ip,
             break;
         }
     }
+
+    free(req_segments.segments); /* fixed-array params need no cleanup */
 
 send:
     if (res.status == 0) {
@@ -1262,31 +1423,31 @@ HttpServerResult http_create_server(const ServerArgs *server_args,
         return SERVER_ERROR;
     }
 
-    out->routes = malloc(HTTP_ROUTE_INITIAL_CAP * sizeof(HttpRoute));
-    if (out->routes == NULL) {
+    out->routes.routes = malloc(8 * sizeof(HttpRoute));
+    if (out->routes.routes == NULL) {
         close(server_fd); /* don't leak the socket */
         return SERVER_ERROR;
     }
-    out->route_count = 0;
-    out->route_capacity = HTTP_ROUTE_INITIAL_CAP;
+    out->routes.count = 0;
+    out->routes.capacity = 8;
 
     /* server_name is copied — the library does not depend on the
      * caller's memory. */
     out->server_name = strdup(server_args->server_name);
     if (out->server_name == NULL) {
-        free(out->routes);
-        out->routes = NULL;
+        free(out->routes.routes);
+        out->routes.routes = NULL;
         close(server_fd);
         return SERVER_ERROR;
     }
 
-    out->middlewares = NULL;
-    out->middleware_count = 0;
-    out->middleware_capacity = 0;
+    out->middlewares.middlewares = NULL;
+    out->middlewares.count = 0;
+    out->middlewares.capacity = 0;
 
-    out->encoders = NULL;
-    out->encoder_count = 0;
-    out->encoder_capacity = 0;
+    out->encoders.encoders = NULL;
+    out->encoders.count = 0;
+    out->encoders.capacity = 0;
     http_register_encoder(out, http_gzip_encoder);
     http_register_encoder(out, http_identity_encoder);
 
@@ -1309,23 +1470,24 @@ void http_close_server(HttpServer *server)
         server->fd = -1; /* protect against a double close */
     }
 
-    for (size_t i = 0; i < server->route_count; i++) {
-        free((void *)server->routes[i].path);
+    for (size_t i = 0; i < server->routes.count; i++) {
+        free(server->routes.routes[i].route_segments.segments);
+        free((void *)server->routes.routes[i].path);
     }
-    free(server->routes);
-    server->routes = NULL;
-    server->route_count = server->route_capacity = 0;
+    free(server->routes.routes);
+    server->routes.routes = NULL;
+    server->routes.count = server->routes.capacity = 0;
 
-    for (size_t i = 0; i < server->middleware_count; i++) {
-        free((void *)server->middlewares[i].path);
+    for (size_t i = 0; i < server->middlewares.count; i++) {
+        free((void *)server->middlewares.middlewares[i].path);
     }
-    free(server->middlewares);
-    server->middlewares = NULL;
-    server->middleware_count = server->middleware_capacity = 0;
+    free(server->middlewares.middlewares);
+    server->middlewares.middlewares = NULL;
+    server->middlewares.count = server->middlewares.capacity = 0;
 
-    free(server->encoders);
-    server->encoders = NULL;
-    server->encoder_count = server->encoder_capacity = 0;
+    free(server->encoders.encoders);
+    server->encoders.encoders = NULL;
+    server->encoders.count = server->encoders.capacity = 0;
 
     http_static_mounts_free(server);
 
@@ -1353,10 +1515,38 @@ void http_listen(HttpServer *server)
     HTTP_ASSERT(server->fd >= 0);
     HTTP_ASSERT_MSG(server->listening == false,
                     "http_listen called twice — server already listening");
-    HTTP_ASSERT(server->routes != NULL);
+    HTTP_ASSERT(server->routes.routes != NULL);
 
     server->listening = true;
     printf("Server listening on port %d\n", server->port);
+
+#ifndef NDEBUG
+    printf("============= ALL ROUTES REGISTERED ==============\n");
+    for (size_t i = 0; i < server->routes.count; i++) {
+        printf("route: %s\n", server->routes.routes[i].path);
+
+        if (strcmp(server->routes.routes[i].path, "/") == 0) {
+            printf("segments: root path, no segments\n");
+            continue;
+        }
+        printf("segments: ");
+        for (size_t x = 0; x < server->routes.routes[i].route_segments.count;
+             x++) {
+            char *is_param_text = "false";
+            if (server->routes.routes[i].route_segments.segments[x].is_param) {
+                is_param_text = "true";
+            }
+            printf("text: \"%s\" ",
+                   server->routes.routes[i].route_segments.segments[x].text);
+            printf("is_param: %s", is_param_text);
+            if (x < server->routes.routes[i].route_segments.count - 1) {
+                printf(" | ");
+            }
+        }
+        printf("\n");
+    }
+    printf("============= END ==============\n");
+#endif
 
     while (server->listening) {
         struct sockaddr_in client_addr;
@@ -1414,19 +1604,26 @@ static HttpRouteAddResult http_add_route(HttpServer *server, const char *path,
         return HTTP_ROUTE_ADD_ERROR;
     }
 
-    if (server->route_count == server->route_capacity) {
-        size_t new_cap = server->route_capacity * 2;
-        HttpRoute *tmp = realloc(server->routes, new_cap * sizeof(HttpRoute));
+    /* A '?' in a pattern can never match either: the query string is
+     * stripped from the request path BEFORE routing. Fail fast. */
+    if (strchr(path, '?') != NULL) {
+        return HTTP_ROUTE_ADD_ERROR;
+    }
+
+    if (server->routes.count == server->routes.capacity) {
+        size_t new_cap = server->routes.capacity * 2;
+        HttpRoute *tmp =
+            realloc(server->routes.routes, new_cap * sizeof(HttpRoute));
         if (tmp == NULL) {
             return HTTP_ROUTE_ADD_ERROR;
         }
-        server->routes = tmp;
-        server->route_capacity = new_cap;
+        server->routes.routes = tmp;
+        server->routes.capacity = new_cap;
     }
 
-    for (size_t i = 0; i < server->route_count; i++) {
-        if (server->routes[i].method == method &&
-            strcmp(server->routes[i].path, path) == 0) {
+    for (size_t i = 0; i < server->routes.count; i++) {
+        if (server->routes.routes[i].method == method &&
+            strcmp(server->routes.routes[i].path, path) == 0) {
             return HTTP_ROUTE_ADD_CONFLICT;
         }
     }
@@ -1436,8 +1633,48 @@ static HttpRouteAddResult http_add_route(HttpServer *server, const char *path,
         return HTTP_ROUTE_ADD_ERROR;
     }
 
-    server->routes[server->route_count++] =
-        (HttpRoute){.path = owned_path, .handler = handler, .method = method};
+    /* Write directly into the array slot (no intermediate struct copy):
+     * count is only incremented on success, so a failure leaves the
+     * routes array untouched. */
+    HttpRoute *slot = &server->routes.routes[server->routes.count];
+    slot->path = owned_path;
+    slot->handler = handler;
+    slot->method = method;
+    if (!parse_route_segments(owned_path, &slot->route_segments)) {
+        free(owned_path); /* FIX: leaked the owned path on parse failure */
+        return HTTP_ROUTE_ADD_ERROR;
+    }
+
+    /* Validate the params NOW (fail fast at registration) instead of
+     * silently never matching at request time: more params than the
+     * request can bind, or a name longer than the param key buffer. */
+    size_t param_count = 0;
+    for (size_t i = 0; i < slot->route_segments.count; i++) {
+        const HttpRouteSegment *segment = &slot->route_segments.segments[i];
+        if (!segment->is_param) {
+            continue;
+        }
+        param_count++;
+        if (param_count > HTTP_MAX_PARAMS ||
+            strlen(segment->text) >= HTTP_PARAM_KEY_MAX) {
+            free(slot->route_segments.segments);
+            free(owned_path);
+            return HTTP_ROUTE_ADD_ERROR;
+        }
+        /* Express parity: duplicate param names in one pattern are
+         * ambiguous (http_req_param would silently return the first
+         * binding) — reject at registration, not at request time. */
+        for (size_t j = 0; j < i; j++) {
+            const HttpRouteSegment *other = &slot->route_segments.segments[j];
+            if (other->is_param && strcmp(other->text, segment->text) == 0) {
+                free(slot->route_segments.segments);
+                free(owned_path);
+                return HTTP_ROUTE_ADD_ERROR;
+            }
+        }
+    }
+
+    server->routes.count++; /* slot is complete — commit */
 
     return HTTP_ROUTE_ADD_OK;
 }
@@ -1513,17 +1750,17 @@ HttpMiddlewareAddResult http_middleware(HttpServer *server, const char *path,
         return HTTP_MIDDLEWARE_ADD_ERROR;
     }
 
-    if (server->middleware_count == server->middleware_capacity) {
-        size_t new_cap = server->middleware_capacity == 0
+    if (server->middlewares.count == server->middlewares.capacity) {
+        size_t new_cap = server->middlewares.capacity == 0
                              ? 8
-                             : server->middleware_capacity * 2;
-        HttpMiddleware *tmp =
-            realloc(server->middlewares, new_cap * sizeof(HttpMiddleware));
+                             : server->middlewares.capacity * 2;
+        HttpMiddleware *tmp = realloc(server->middlewares.middlewares,
+                                      new_cap * sizeof(HttpMiddleware));
         if (tmp == NULL) {
             return HTTP_MIDDLEWARE_ADD_ERROR;
         }
-        server->middlewares = tmp;
-        server->middleware_capacity = new_cap;
+        server->middlewares.middlewares = tmp;
+        server->middlewares.capacity = new_cap;
     }
 
     char *owned_path = NULL;
@@ -1534,7 +1771,7 @@ HttpMiddlewareAddResult http_middleware(HttpServer *server, const char *path,
         }
     }
 
-    server->middlewares[server->middleware_count++] =
+    server->middlewares.middlewares[server->middlewares.count++] =
         (HttpMiddleware){.path = owned_path, .handler = handler};
 
     return HTTP_MIDDLEWARE_ADD_OK;
@@ -1632,4 +1869,17 @@ HttpMiddlewareAddResult http_group_middleware(HttpGroup *group,
         return HTTP_MIDDLEWARE_ADD_ERROR;
     }
     return http_middleware(group->server, full, handler);
+}
+
+const char *http_req_param(const HttpRequest *req, const char *key)
+{
+    if (req == NULL || key == NULL) {
+        return NULL;
+    }
+    for (size_t i = 0; i < req->params.count; i++) {
+        if (strcmp(key, req->params.params[i].key) == 0) {
+            return req->params.params[i].value;
+        }
+    }
+    return NULL;
 }

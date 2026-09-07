@@ -12,9 +12,10 @@
  * the 4-KiB body buffer. */
 
 /* realpath() is XSI (not base POSIX) — _XOPEN_SOURCE 700 enables it in
- * glibc, even when the target also defines _POSIX_C_SOURCE. */
+ * glibc, even when the target also defines _POSIX_C_SOURCE. Kept in
+ * the source (not CMake) so the amalgamation keeps it too. */
 #ifndef _XOPEN_SOURCE
-#define _XOPEN_SOURCE 700
+#define _XOPEN_SOURCE 700 /* NOLINT(bugprone-reserved-identifier) */
 #endif
 
 #include "c_http_static.h"
@@ -87,7 +88,7 @@ static int url_decode(const char *in, char *out, size_t out_size)
             if (hi == 0 && lo == 0) {
                 return -1; /* %00 */
             }
-            out[o++] = (char)(hi * 16 + lo);
+            out[o++] = (char)((hi * 16) + lo);
             i += 2;
         } else {
             out[o++] = in[i];

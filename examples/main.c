@@ -30,12 +30,31 @@ static void on_terminate(int sig)
 
 static void home_handler(const HttpRequest *req, HttpResponse *res)
 {
+    printf("home handler\n");
     (void)req;
     res->status = 200;
     const char *b = "<h1>Welcome to c-http</h1>"
                     "<p>Try: <a href=\"/api/status\">/api/status</a>, "
                     "<a href=\"/api/users\">/api/users</a>, "
                     "<a href=\"/admin/dashboard\">/admin/dashboard</a></p>";
+    size_t len = strlen(b);
+    memcpy(res->body, b, len);
+    res->body_len = len;
+}
+
+static void id_test_handler(const HttpRequest *req, HttpResponse *res)
+{
+    printf("id test handler\n");
+    char b[64];
+    const char *id = http_req_param(req, "id");
+    if (id == NULL) {
+        snprintf(b, sizeof(b), "<h1>unable to get id param</h1>");
+    } else {
+        snprintf(b, sizeof(b),
+                 "<h1>your id: %s</h1><a href=\"/\">back to home</a>", id);
+    }
+
+    res->status = 200;
     size_t len = strlen(b);
     memcpy(res->body, b, len);
     res->body_len = len;
@@ -179,8 +198,8 @@ int main(int argc, char **argv)
     }
 
     HTTP_ASSERT(server.fd >= 0);
-    HTTP_ASSERT(server.routes != NULL);
-    HTTP_ASSERT(server.encoder_count >= 2);
+    HTTP_ASSERT(server.routes.routes != NULL);
+    HTTP_ASSERT(server.encoders.count >= 2);
 
     g_server = &server;
     struct sigaction sa;
@@ -195,6 +214,8 @@ int main(int argc, char **argv)
 
     /* --- Top-level routes --- */
     http_get(&server, "/", home_handler);
+
+    http_get(&server, "/:id/test", id_test_handler);
 
     /* --- Static files: /public/<path> is served from args.root.
      * Files larger than the 4-KiB body buffer are streamed. --- */

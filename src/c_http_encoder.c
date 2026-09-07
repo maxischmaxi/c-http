@@ -87,21 +87,21 @@ HttpEncoderAddResult http_register_encoder(HttpServer *server,
     HTTP_ASSERT(encoder.encode != NULL);
     HTTP_ASSERT_MSG(server->listening == false,
                     "cannot register encoder while server is listening");
-    HTTP_ASSERT(server->encoder_count <= server->encoder_capacity);
+    HTTP_ASSERT(server->encoders.count <= server->encoders.capacity);
 
-    if (server->encoder_count == server->encoder_capacity) {
+    if (server->encoders.count == server->encoders.capacity) {
         size_t new_cap =
-            server->encoder_capacity == 0 ? 4 : server->encoder_capacity * 2;
+            server->encoders.capacity == 0 ? 4 : server->encoders.capacity * 2;
         HttpEncoder *tmp =
-            realloc(server->encoders, new_cap * sizeof(HttpEncoder));
+            realloc(server->encoders.encoders, new_cap * sizeof(HttpEncoder));
         if (!tmp) {
             return HTTP_ENCODER_ADD_ERROR;
         }
-        server->encoders = tmp;
-        server->encoder_capacity = new_cap;
+        server->encoders.encoders = tmp;
+        server->encoders.capacity = new_cap;
     }
 
-    server->encoders[server->encoder_count++] = encoder;
+    server->encoders.encoders[server->encoders.count++] = encoder;
     return HTTP_ENCODER_ADD_OK;
 }
 
@@ -133,20 +133,27 @@ static double parse_q(const char **pp)
 
     while (*p == ';') {
         p++; /* skip ';' */
-        while (*p == ' ' || *p == '\t')
+        while (*p == ' ' || *p == '\t') {
             p++;
+        }
 
         if ((p[0] == 'q' || p[0] == 'Q') && p[1] == '=') {
             char *end = NULL;
             double v = strtod(p + 2, &end);
-            if (end != p + 2 && v >= 0.0)
+            if (end != p + 2 && v >= 0.0) {
+
                 q = v;
-            if (q > 1.0)
+            }
+            if (q > 1.0) {
+
                 q = 1.0;
+            }
         }
 
-        while (*p && *p != ';' && *p != ',')
+        while (*p && *p != ';' && *p != ',') {
+
             p++;
+        }
     }
 
     *pp = p;
@@ -158,8 +165,9 @@ static double parse_q(const char **pp)
  * first). "*" only matches encodings that are not explicitly listed. */
 bool http_accepts_encoding(const HttpRequest *req, const char *encoding)
 {
-    if (req == NULL || encoding == NULL || *encoding == '\0')
+    if (req == NULL || encoding == NULL || *encoding == '\0') {
         return false;
+    }
 
     bool specific_found = false;
     bool specific_ok = false;
@@ -174,52 +182,62 @@ bool http_accepts_encoding(const HttpRequest *req, const char *encoding)
 
         const char *p = req->headers.items[i].value;
         while (*p) {
-            while (*p == ' ' || *p == '\t' || *p == ',')
+            while (*p == ' ' || *p == '\t' || *p == ',') {
                 p++;
-            if (*p == '\0')
+            }
+            if (*p == '\0') {
                 break;
+            }
 
             /* read the coding name (until ',' or ';') */
             const char *name_start = p;
-            while (*p && *p != ',' && *p != ';')
+            while (*p && *p != ',' && *p != ';') {
                 p++;
+            }
             const char *name_end = p;
             while (name_end > name_start &&
-                   (name_end[-1] == ' ' || name_end[-1] == '\t'))
+                   (name_end[-1] == ' ' || name_end[-1] == '\t')) {
                 name_end--;
+            }
 
             size_t name_len = (size_t)(name_end - name_start);
-            bool wildcard = (name_len == 1 && name_start[0] == '*');
-            bool match =
-                wildcard || (name_len == strlen(encoding) &&
-                             strncasecmp(name_start, encoding, name_len) == 0);
+            bool wildcard = (name_len == 1 && name_start[0] == '*') != 0;
+            bool match = (wildcard || (name_len == strlen(encoding) &&
+                                       strncasecmp(name_start, encoding,
+                                                   name_len) == 0)) != 0;
 
             double q = 1.0;
-            if (*p == ';')
+            if (*p == ';') {
                 q = parse_q(&p);
+            }
 
             if (wildcard) {
                 wildcard_found = true;
-                if (q > wildcard_q)
+                if (q > wildcard_q) {
                     wildcard_q = q;
+                }
             } else if (match) {
                 specific_found = true;
-                if (q > 0.0)
+                if (q > 0.0) {
                     specific_ok = true; /* highest q wins */
+                }
             }
 
             /* skip to the next list element */
-            while (*p && *p != ',')
+            while (*p && *p != ',') {
                 p++;
-            if (*p == ',')
+            }
+            if (*p == ',') {
                 p++;
+            }
         }
     }
 
     /* Explicit mention beats the wildcard: "gzip;q=0, *" rejects gzip. */
-    if (specific_found)
+    if (specific_found) {
         return specific_ok;
-    return wildcard_found && wildcard_q > 0.0;
+    }
+    return (wildcard_found && wildcard_q > 0.0) != 0;
 }
 
 bool http_encode_body(HttpServer *server, const HttpRequest *req,
@@ -230,7 +248,8 @@ bool http_encode_body(HttpServer *server, const HttpRequest *req,
     HTTP_ASSERT(res != NULL);
     HTTP_ASSERT_MSG(res->body_len <= sizeof(res->body),
                     "body_len exceeds body buffer");
-    HTTP_ASSERT(server->encoders != NULL || server->encoder_count == 0);
+    HTTP_ASSERT(server->encoders.encoders != NULL ||
+                server->encoders.count == 0);
 
     if (res->body_len == 0 || res->encoded_body != NULL) {
         return false;
@@ -245,15 +264,15 @@ bool http_encode_body(HttpServer *server, const HttpRequest *req,
     }
 
     /* Try the registered encoders */
-    for (size_t i = 0; i < server->encoder_count; i++) {
-        if (!http_accepts_encoding(req, server->encoders[i].name)) {
+    for (size_t i = 0; i < server->encoders.count; i++) {
+        if (!http_accepts_encoding(req, server->encoders.encoders[i].name)) {
             continue;
         }
 
         char *encoded = NULL;
         size_t encoded_len = 0;
-        if (server->encoders[i].encode(res->body, res->body_len, &encoded,
-                                       &encoded_len) != 0) {
+        if (server->encoders.encoders[i].encode(res->body, res->body_len,
+                                                &encoded, &encoded_len) != 0) {
             continue;
         }
 
@@ -266,7 +285,7 @@ bool http_encode_body(HttpServer *server, const HttpRequest *req,
         res->encoded_body = encoded;
         res->encoded_body_len = encoded_len;
         http_set_header(&res->headers, HTTP_HEADER_CONTENT_ENCODING,
-                        server->encoders[i].name);
+                        server->encoders.encoders[i].name);
         return true;
     }
 

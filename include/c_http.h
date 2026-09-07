@@ -7,14 +7,19 @@
 
 #define C_HTTP_VERSION "0.5.0"
 
-#define HTTP_ROUTE_INITIAL_CAP 8
-
 /* Parsing limits: buffer sizes must match these values. */
 #define HTTP_METHOD_MAX  8 /* longest known method: "CONNECT" */
 #define HTTP_PATH_MAX    512
 #define HTTP_VERSION_MAX 16
-#define HTTP_MAX_HEADERS 64              /* more request headers -> 431 */
-#define HTTP_MAX_BODY    (1024u * 1024u) /* larger request body -> 413 */
+#define HTTP_MAX_HEADERS 64                    /* more request headers -> 431 */
+#define HTTP_MAX_BODY    (50ULL * 1024 * 1024) /* larger request body -> 413 */
+
+/* Route param limits: a ":name" segment in a route pattern binds exactly
+ * one request segment. Fixed buffers — patterns with more params (or
+ * longer names) are rejected at registration time. */
+#define HTTP_MAX_PARAMS      16
+#define HTTP_PARAM_KEY_MAX   32
+#define HTTP_PARAM_VALUE_MAX 64
 
 #define HTTP_HEADER_A_IM            "A-IM"
 #define HTTP_HEADER_ACCEPT          "Accept"
@@ -259,15 +264,42 @@ typedef struct {
 } HttpEncoder;
 
 typedef struct {
+    HttpEncoder *encoders;
+    size_t count;
+    size_t capacity;
+} HttpEncoders;
+
+typedef struct {
     char *key;
     char *value;
 } HttpHeader;
+
+typedef struct {
+    char key[HTTP_PARAM_KEY_MAX];     /* param name without the ':' */
+    char value[HTTP_PARAM_VALUE_MAX]; /* bound request segment */
+} HttpParam;
+
+typedef struct {
+    char text[64]; /* literal text OR the param name */
+    bool is_param;
+} HttpRouteSegment;
+
+typedef struct {
+    HttpRouteSegment *segments;
+    size_t count;
+    size_t capacity;
+} HttpRouteSegments;
 
 typedef struct {
     HttpHeader *items;
     size_t count;
     size_t capacity;
 } HttpHeaders;
+
+typedef struct {
+    HttpParam params[HTTP_MAX_PARAMS];
+    size_t count;
+} HttpParams;
 
 typedef struct {
     uint16_t port;
@@ -284,6 +316,7 @@ typedef struct {
      * after the request). NULL if no body was sent. */
     char *body;
     size_t body_len;
+    HttpParams params;
 } HttpRequest;
 
 typedef struct {
@@ -308,7 +341,14 @@ typedef struct {
     const char *path;
     HttpHandler handler;
     HttpMethod method;
+    HttpRouteSegments route_segments;
 } HttpRoute;
+
+typedef struct {
+    HttpRoute *routes;
+    size_t count;
+    size_t capacity;
+} HttpRoutes;
 
 typedef struct {
     const char *path;
@@ -316,19 +356,19 @@ typedef struct {
 } HttpMiddleware;
 
 typedef struct {
+    HttpMiddleware *middlewares;
+    size_t count;
+    size_t capacity;
+} HttpMiddlewares;
+
+typedef struct {
     uint16_t port;
     const char *bind_addr;
     int fd;
     bool listening;
-    HttpRoute *routes;
-    size_t route_count;
-    size_t route_capacity;
-    HttpMiddleware *middlewares;
-    size_t middleware_count;
-    size_t middleware_capacity;
-    HttpEncoder *encoders;
-    size_t encoder_count;
-    size_t encoder_capacity;
+    HttpRoutes routes;
+    HttpMiddlewares middlewares;
+    HttpEncoders encoders;
     char *server_name;
     /* Opaque mount list for static files — owned and managed by
      * c_http_static.c (see c_http_static.h). NULL while nothing is
@@ -402,6 +442,10 @@ void http_headers_free(HttpHeaders *headers);
 bool http_accepts_encoding(const HttpRequest *req, const char *encoding);
 bool http_encode_body(HttpServer *server, const HttpRequest *req,
                       HttpResponse *res);
+/* Route param access: returns the bound value for ":name" params of the
+ * matched route, or NULL if the param does not exist. Only meaningful
+ * inside a handler (params are per-request). */
+const char *http_req_param(const HttpRequest *req, const char *key);
 
 extern const HttpEncoder http_gzip_encoder;
 extern const HttpEncoder http_identity_encoder;

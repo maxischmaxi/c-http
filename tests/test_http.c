@@ -5,11 +5,10 @@
  * covered. An alarm() watchdog fails the test if anything deadlocks.
  */
 #include <arpa/inet.h>
-#include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
-#include <signal.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -99,8 +98,9 @@ static size_t raw_request(uint16_t port, const void *data, size_t len,
                           char *out, size_t outsz)
 {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0)
+    if (fd < 0) {
         return 0;
+    }
 
     struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -120,16 +120,18 @@ static size_t raw_request(uint16_t port, const void *data, size_t len,
     size_t sent = 0;
     while (sent < len) {
         ssize_t s = send(fd, (const char *)data + sent, len - sent, 0);
-        if (s <= 0)
+        if (s <= 0) {
             break;
+        }
         sent += (size_t)s;
     }
 
     size_t total = 0;
     while (total + 1 < outsz) {
         ssize_t r = recv(fd, out + total, outsz - 1 - total, 0);
-        if (r <= 0)
+        if (r <= 0) {
             break;
+        }
         total += (size_t)r;
     }
     out[total] = '\0';
@@ -156,7 +158,9 @@ static bool wait_listening(uint16_t port)
             return true;
         }
         close(fd);
-        nanosleep(&(struct timespec){.tv_nsec = 20 * 1000 * 1000}, NULL);
+        nanosleep(
+            &(struct timespec){.tv_nsec = (__syscall_slong_t)20 * 1000 * 1000},
+            NULL);
     }
     return false;
 }
@@ -288,11 +292,13 @@ static void test_group_paths(void)
 
     /* "/api/users" and "/api" registered */
     bool found_users = false, found_api = false;
-    for (size_t i = 0; i < srv.route_count; i++) {
-        if (strcmp(srv.routes[i].path, "/api/users") == 0)
+    for (size_t i = 0; i < srv.routes.count; i++) {
+        if (strcmp(srv.routes.routes[i].path, "/api/users") == 0) {
             found_users = true;
-        if (strcmp(srv.routes[i].path, "/api") == 0)
+        }
+        if (strcmp(srv.routes.routes[i].path, "/api") == 0) {
             found_api = true;
+        }
     }
     CHECK(found_users);
     CHECK(found_api);
@@ -317,8 +323,9 @@ static void test_integration(void)
         }
     }
     CHECK(created);
-    if (!created)
+    if (!created) {
         return;
+    }
     g_port = g_srv.port;
 
     http_middleware(&g_srv, NULL, h_auth_mw);
@@ -380,8 +387,9 @@ static void test_integration(void)
     /* 8) overlong URI -> 414 */
     char long_req[1024];
     strcpy(long_req, "GET /");
-    for (int i = 0; i < 600; i++)
+    for (int i = 0; i < 600; i++) {
         strcat(long_req, "a");
+    }
     strcat(long_req, " HTTP/1.1\r\nHost: t\r\n\r\n");
     n = get(long_req, rsp, sizeof(rsp));
     CHECK(n > 0);
@@ -440,7 +448,9 @@ static void test_integration(void)
             "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\n\r\n";
         char body_req[128];
         memcpy(body_req, head, sizeof(head) - 1);
-        memcpy(body_req + sizeof(head) - 1, "ab\0cd", 5);
+        memcpy(body_req + sizeof(head) - 1, "ab\0cd",
+               5); /* memcpy: a
+                    * strcpy would stop at the NUL */
         size_t reqlen = sizeof(head) - 1 + 5;
         n = raw_request(g_port, body_req, reqlen, rsp, sizeof(rsp));
         CHECK(n > 0);
@@ -547,8 +557,9 @@ static void test_static_files(void)
         }
     }
     CHECK(created);
-    if (!created)
+    if (!created) {
         return;
+    }
     g_port = g_srv.port;
 
     CHECK(http_static_mount(&g_srv, &(HttpStaticConfig){
@@ -733,6 +744,547 @@ static void test_static_files(void)
     rmdir(www);
 }
 
+static void h_param(const HttpRequest *req, HttpResponse *res)
+{
+    res->status = HTTP_STATUS_OK;
+    http_set_header(&res->headers, HTTP_HEADER_CONTENT_TYPE, "text/plain");
+    const char *id = http_req_param(req, "id");
+    const char *name = http_req_param(req, "name");
+    int n = snprintf(res->body, sizeof(res->body), "id=%s name=%s",
+                     id != NULL ? id : "-", name != NULL ? name : "-");
+    if (n > 0) {
+        res->body_len =
+            (size_t)n < sizeof(res->body) ? (size_t)n : sizeof(res->body) - 1;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* route params: registration limits (unit)                           */
+/* ------------------------------------------------------------------ */
+
+static void test_param_registration(void)
+{
+    ServerArgs args = {.port = 0, .bind_addr = "127.0.0.1", .server_name = "t"};
+    HttpServer srv;
+    CHECK(http_create_server(&args, &srv) == SERVER_OK);
+
+    /* --- valid patterns --- */
+    CHECK(http_get(&srv, "/users/:id", h_root) == HTTP_ROUTE_ADD_OK);
+    CHECK(http_get(&srv, "/:id", h_root) == HTTP_ROUTE_ADD_OK);
+    CHECK(http_get(&srv, "/:a/:b/:c", h_root) == HTTP_ROUTE_ADD_OK);
+
+    /* exactly HTTP_MAX_PARAMS (16) params: still fine */
+    {
+        char pattern[128];
+        size_t off = (size_t)snprintf(pattern, sizeof(pattern), "/p");
+        for (size_t i = 0; i < HTTP_MAX_PARAMS; i++) {
+            off += (size_t)snprintf(pattern + off, sizeof(pattern) - off,
+                                    "/:p%zu", i);
+        }
+        CHECK(off < sizeof(pattern));
+        CHECK(http_get(&srv, pattern, h_root) == HTTP_ROUTE_ADD_OK);
+    }
+
+    /* param name of HTTP_PARAM_KEY_MAX-1 chars (excluding the ':'):
+     * the longest one that fits */
+    {
+        char name[40];
+        name[0] = ':';
+        memset(name + 1, 'n', HTTP_PARAM_KEY_MAX - 2);
+        name[HTTP_PARAM_KEY_MAX - 1] = '\0';
+        char pattern[64];
+        snprintf(pattern, sizeof(pattern), "/x/%s", name);
+        CHECK(http_get(&srv, pattern, h_root) == HTTP_ROUTE_ADD_OK);
+    }
+
+    /* literal segment of 63 chars: max that fits into text[64] */
+    {
+        char pattern[80];
+        size_t off = (size_t)snprintf(pattern, sizeof(pattern), "/x/");
+        memset(pattern + off, 'a', 63);
+        pattern[off + 63] = '\0';
+        CHECK(http_get(&srv, pattern, h_root) == HTTP_ROUTE_ADD_OK);
+    }
+
+    /* trailing slash on a param route: same shape, different string,
+     * both are allowed (first registered wins at request time) */
+    CHECK(http_get(&srv, "/users/:id/", h_param) == HTTP_ROUTE_ADD_OK);
+
+    /* same shape, different param names: allowed (first wins) */
+    CHECK(http_get(&srv, "/users/:name", h_root) == HTTP_ROUTE_ADD_OK);
+
+    /* case-sensitive param names are distinct */
+    CHECK(http_get(&srv, "/case/:ID", h_root) == HTTP_ROUTE_ADD_OK);
+    CHECK(http_get(&srv, "/case/:id", h_root) == HTTP_ROUTE_ADD_OK);
+
+    /* --- rejected patterns (fail fast at registration) --- */
+
+    /* one param too many (17 > HTTP_MAX_PARAMS) */
+    {
+        char pattern[128];
+        size_t off = (size_t)snprintf(pattern, sizeof(pattern), "/p");
+        for (size_t i = 0; i <= HTTP_MAX_PARAMS; i++) {
+            off += (size_t)snprintf(pattern + off, sizeof(pattern) - off,
+                                    "/:p%zu", i);
+        }
+        CHECK(off < sizeof(pattern));
+        CHECK(http_get(&srv, pattern, h_root) == HTTP_ROUTE_ADD_ERROR);
+    }
+
+    /* param name of HTTP_PARAM_KEY_MAX chars (excluding the ':'):
+     * one over the buffer — the parser strips the leading ':' */
+    {
+        char name[40];
+        name[0] = ':';
+        memset(name + 1, 'n', HTTP_PARAM_KEY_MAX);
+        name[HTTP_PARAM_KEY_MAX + 1] = '\0';
+        char pattern[64];
+        snprintf(pattern, sizeof(pattern), "/x/%s", name);
+        CHECK(http_get(&srv, pattern, h_root) == HTTP_ROUTE_ADD_ERROR);
+    }
+
+    /* literal segment of 64 chars: one char over the segment buffer */
+    {
+        char pattern[80];
+        size_t off = (size_t)snprintf(pattern, sizeof(pattern), "/x/");
+        memset(pattern + off, 'a', 64);
+        pattern[off + 64] = '\0';
+        CHECK(http_get(&srv, pattern, h_root) == HTTP_ROUTE_ADD_ERROR);
+    }
+
+    /* duplicate param names: ambiguous — rejected (Express parity) */
+    CHECK(http_get(&srv, "/dup/:id/x/:id", h_root) == HTTP_ROUTE_ADD_ERROR);
+    CHECK(http_get(&srv, "/dup2/:id/:id", h_root) == HTTP_ROUTE_ADD_ERROR);
+
+    /* '?' can never match (query string is stripped before routing) */
+    CHECK(http_get(&srv, "/q/:id?a=1", h_root) == HTTP_ROUTE_ADD_ERROR);
+    CHECK(http_get(&srv, "/q?x", h_root) == HTTP_ROUTE_ADD_ERROR);
+
+    /* bare ':' without a name */
+    CHECK(http_get(&srv, "/:", h_root) == HTTP_ROUTE_ADD_ERROR);
+    CHECK(http_get(&srv, "/x/:/y", h_root) == HTTP_ROUTE_ADD_ERROR);
+
+    /* ':' mid-segment is a LITERAL, not a param marker (only a leading
+     * ':' starts a param) — registers fine, matches via strcmp */
+    CHECK(http_get(&srv, "/lit/a:b", h_root) == HTTP_ROUTE_ADD_OK);
+
+    /* same string twice: conflict (string comparison, as documented) */
+    CHECK(http_get(&srv, "/users/:id", h_root) == HTTP_ROUTE_ADD_CONFLICT);
+
+    /* double close must survive (frees the route segments) */
+    http_close_server(&srv);
+    http_close_server(&srv);
+}
+
+static void test_route_params(void)
+{
+    ServerArgs args = {.port = 0, .bind_addr = "127.0.0.1", .server_name = "t"};
+    HttpServer srv;
+    CHECK(http_create_server(&args, &srv) == SERVER_OK);
+
+    /* unit: http_req_param on an empty request */
+    HttpRequest empty = {0};
+    CHECK(http_req_param(&empty, "id") == NULL);
+    CHECK(http_req_param(NULL, "id") == NULL);
+    CHECK(http_req_param(&empty, NULL) == NULL);
+
+    /* registration validation */
+    CHECK(http_get(&srv, "/", h_root) == HTTP_ROUTE_ADD_OK);
+    CHECK(http_get(&srv, "/users/:id", h_param) == HTTP_ROUTE_ADD_OK);
+    CHECK(http_get(&srv, "/users/new", h_root) == HTTP_ROUTE_ADD_OK);
+    CHECK(http_get(&srv, "/users/:id/files/:name", h_param) ==
+          HTTP_ROUTE_ADD_OK);
+    /* same pattern twice: conflict */
+    CHECK(http_get(&srv, "/users/:id", h_param) == HTTP_ROUTE_ADD_CONFLICT);
+    /* bare ':' and oversized param names are registration errors */
+    CHECK(http_get(&srv, "/bad/:", h_root) == HTTP_ROUTE_ADD_ERROR);
+    CHECK(http_get(&srv, "/bad/:/x", h_root) == HTTP_ROUTE_ADD_ERROR);
+    {
+        char long_name[80];
+        long_name[0] = ':';
+        memset(long_name + 1, 'p', sizeof(long_name) - 2);
+        long_name[sizeof(long_name) - 1] = '\0';
+        char pattern[96];
+        snprintf(pattern, sizeof(pattern), "/x%s", long_name);
+        CHECK(http_get(&srv, pattern, h_root) == HTTP_ROUTE_ADD_ERROR);
+    }
+
+    /* routes for dispatch tests on a live server */
+    CHECK(http_get(&srv, "/literal", h_root) == HTTP_ROUTE_ADD_OK);
+    http_post(&srv, "/literal", h_root);
+
+    bool created = false;
+    for (uint32_t port = TEST_PORT_START; port <= TEST_PORT_END; port++) {
+        ServerArgs sargs = {.port = (uint16_t)port,
+                            .bind_addr = "127.0.0.1",
+                            .server_name = "test"};
+        if (http_create_server(&sargs, &g_srv) == SERVER_OK) {
+            created = true;
+            break;
+        }
+    }
+    CHECK(created);
+    if (!created)
+        return;
+    g_port = g_srv.port;
+
+    /* literal BEFORE the :id route — first match wins (Express
+     * semantics: registration order decides between matching routes) */
+    http_get(&g_srv, "/users/new", h_root);
+    http_get(&g_srv, "/users/:id", h_param);
+    http_get(&g_srv, "/users/:id/files/:name", h_param);
+    http_get(&g_srv, "/literal", h_root);
+    http_post(&g_srv, "/literal", h_root);
+    http_get(&g_srv, "/", h_root);
+
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, server_thread, NULL) == 0);
+    CHECK(wait_listening(g_port));
+    g_srv_ready = true;
+
+    char rsp[64 * 1024];
+    size_t n;
+
+    /* 1) single param bound */
+    n = get("GET /users/42 HTTP/1.1\r\nHost: t\r\n\r\n", rsp, sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 200", 12) == 0);
+    CHECK(strstr(rsp, "\r\n\r\nid=42 name=-") != NULL);
+
+    /* 2) two params bound */
+    n = get("GET /users/7/files/a.txt HTTP/1.1\r\nHost: t\r\n\r\n", rsp,
+            sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 200", 12) == 0);
+    CHECK(strstr(rsp, "\r\n\r\nid=7 name=a.txt") != NULL);
+
+    /* 3) segment count mismatch -> 404 */
+    n = get("GET /users/42/extra HTTP/1.1\r\nHost: t\r\n\r\n", rsp,
+            sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 404", 12) == 0);
+
+    /* 4) literal route wins over param route (registered first) */
+    n = get("GET /users/new HTTP/1.1\r\nHost: t\r\n\r\n", rsp, sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 200", 12) == 0);
+    CHECK(strstr(rsp, "\r\n\r\nok") != NULL);
+
+    /* 5) trailing slash matches (empty segment is skipped) */
+    n = get("GET /users/42/ HTTP/1.1\r\nHost: t\r\n\r\n", rsp, sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 200", 12) == 0);
+    CHECK(strstr(rsp, "id=42") != NULL);
+
+    /* 6) wrong method on a matching param route -> 405 + Allow: GET */
+    n = get("POST /users/42 HTTP/1.1\r\nHost: t\r\n"
+            "Content-Length: 0\r\n\r\n",
+            rsp, sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 405", 12) == 0);
+    CHECK(strstr(rsp, "Allow: GET") != NULL);
+
+    /* 7) HEAD falls back to the GET param route, no body */
+    n = get("HEAD /users/42 HTTP/1.1\r\nHost: t\r\n\r\n", rsp, sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 200", 12) == 0);
+    CHECK(strcmp(rsp + strlen(rsp) - 4, "\r\n\r\n") == 0);
+
+    /* 8) non-param routes still work exactly as before */
+    n = get("GET /literal HTTP/1.1\r\nHost: t\r\n\r\n", rsp, sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 200", 12) == 0);
+    CHECK(strstr(rsp, "\r\n\r\nok") != NULL);
+
+    /* 9) /literal/x is NOT /literal — no prefix semantics on routes */
+    n = get("GET /literal/x HTTP/1.1\r\nHost: t\r\n\r\n", rsp, sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 404", 12) == 0);
+
+    /* 10) root route still matches */
+    n = get("GET / HTTP/1.1\r\nHost: t\r\n\r\n", rsp, sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 200", 12) == 0);
+
+    http_stop_server(&g_srv);
+    CHECK(pthread_join(th, NULL) == 0);
+    http_close_server(&g_srv);
+    http_close_server(&srv); /* double close must survive */
+}
+
+/* ------------------------------------------------------------------ */
+/* route params: attacks, boundaries, interactions (integration)       */
+/* ------------------------------------------------------------------ */
+
+/* Auth middleware for /users* — middleware must run BEFORE the param
+ * route and must be able to stop the request entirely. */
+static HttpMiddlewareResult users_auth_mw(const HttpRequest *req,
+                                          HttpResponse *res)
+{
+    if (strncmp(req->path, "/users", 6) != 0) {
+        return HTTP_MIDDLEWARE_CONTINUE;
+    }
+    for (size_t i = 0; i < req->headers.count; i++) {
+        if (strcasecmp(req->headers.items[i].key, HTTP_HEADER_AUTHORIZATION) ==
+            0) {
+            return HTTP_MIDDLEWARE_CONTINUE;
+        }
+    }
+    res->status = HTTP_STATUS_UNAUTHORIZED;
+    return HTTP_MIDDLEWARE_STOP;
+}
+
+static void test_params_attacks(void)
+{
+    /* temp root for the mount tests */
+    char www[128];
+    snprintf(www, sizeof(www), "/tmp/c_http_params_attack_%ld", (long)getpid());
+    mkdir(www, 0755);
+    char p[192];
+    snprintf(p, sizeof(p), "%s/style.css", www);
+    CHECK(write_test_file(p, "body {}", 7) == 0);
+
+    bool created = false;
+    for (uint32_t port = TEST_PORT_START; port <= TEST_PORT_END; port++) {
+        ServerArgs sargs = {.port = (uint16_t)port,
+                            .bind_addr = "127.0.0.1",
+                            .server_name = "test"};
+        if (http_create_server(&sargs, &g_srv) == SERVER_OK) {
+            created = true;
+            break;
+        }
+    }
+    CHECK(created);
+    if (!created)
+        return;
+    g_port = g_srv.port;
+
+    /* registration order matters: literal routes BEFORE the catch-all */
+    CHECK(http_get(&g_srv, "/users/:id", h_param) == HTTP_ROUTE_ADD_OK);
+    CHECK(http_delete(&g_srv, "/users/:id", h_param) == HTTP_ROUTE_ADD_OK);
+    CHECK(http_get(&g_srv, "/files/:name", h_param) == HTTP_ROUTE_ADD_OK);
+    CHECK(http_get(&g_srv, "/exact", h_root) == HTTP_ROUTE_ADD_OK);
+
+    HttpGroup api = http_group(&g_srv, "/api");
+    CHECK(http_group_get(&api, "/users/:id", h_param) == HTTP_ROUTE_ADD_OK);
+
+    CHECK(http_static_mount(&g_srv, &(HttpStaticConfig){
+                                        .prefix = "/static",
+                                        .root = www,
+                                    }) == SERVER_OK);
+
+    http_middleware(&g_srv, "/users", users_auth_mw);
+
+    /* catch-all LAST: would otherwise shadow every single-segment route */
+    CHECK(http_get(&g_srv, "/:id", h_param) == HTTP_ROUTE_ADD_OK);
+
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, server_thread, NULL) == 0);
+    CHECK(wait_listening(g_port));
+    g_srv_ready = true;
+
+    char rsp[32 * 1024];
+    size_t n;
+
+    /* --- middleware + params --- */
+
+    /* 1) middleware stops BEFORE the param route runs */
+    n = get("GET /users/42 HTTP/1.1\r\nHost: t\r\n\r\n", rsp, sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 401", 12) == 0);
+
+    /* 2) with Authorization the param binds normally */
+    n = get("GET /users/42 HTTP/1.1\r\nHost: t\r\n"
+            "Authorization: Bearer x\r\n\r\n",
+            rsp, sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 200", 12) == 0);
+    CHECK(strstr(rsp, "\r\n\r\nid=42 name=-") != NULL);
+
+    /* --- traversal / injection: params bind RAW (no URL decoding) --- */
+
+    /* 3) traversal payload is inert: the router does NOT decode, the
+     *    handler receives the literal string, nothing touches the FS */
+    n = get("GET /users/%2e%2e%2f%2e%2e%2fetc%2fpasswd HTTP/1.1\r\n"
+            "Host: t\r\nAuthorization: Bearer x\r\n\r\n",
+            rsp, sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 200", 12) == 0);
+    CHECK(strstr(rsp, "id=%2e%2e%2f%2e%2e%2fetc%2fpasswd") != NULL);
+
+    /* 4) %00 is NOT decoded either — no NUL ever enters req->params */
+    n = get("GET /users/a%00b HTTP/1.1\r\nHost: t\r\n"
+            "Authorization: Bearer x\r\n\r\n",
+            rsp, sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 200", 12) == 0);
+    CHECK(strstr(rsp, "id=a%00b ") != NULL);
+
+    /* 5) a ':' in the request path is stripped like in patterns —
+     *    documents the quirk (no matching literal ':x' routes exist) */
+    n = get("GET /users/:admin HTTP/1.1\r\nHost: t\r\n"
+            "Authorization: Bearer x\r\n\r\n",
+            rsp, sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 200", 12) == 0);
+    CHECK(strstr(rsp, "\r\n\r\nid=admin name=-") != NULL);
+
+    /* 6) a request with a real traversal shape has more segments -> 404,
+     *    and never reaches a handler */
+    n = get("GET /users/../../etc/passwd HTTP/1.1\r\nHost: t\r\n"
+            "Authorization: Bearer x\r\n\r\n",
+            rsp, sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 404", 12) == 0);
+
+    /* --- value length boundaries --- */
+
+    /* 7) 63-char value: the maximum that fits into the param buffer */
+    {
+        char req[256];
+        char val[80];
+        memset(val, 'v', 63);
+        val[63] = '\0';
+        snprintf(req, sizeof(req),
+                 "GET /users/%s HTTP/1.1\r\nHost: t\r\n"
+                 "Authorization: Bearer x\r\n\r\n",
+                 val);
+        n = get(req, rsp, sizeof(rsp));
+        CHECK(n > 0);
+        CHECK(strncmp(rsp, "HTTP/1.1 200", 12) == 0);
+        CHECK(strstr(rsp, "id=vvv") != NULL);
+        char expect[96];
+        snprintf(expect, sizeof(expect), "id=%s name=-", val);
+        CHECK(strstr(rsp, expect) != NULL);
+    }
+
+    /* 8) 64-char segment: over the segment buffer -> parse failure -> 404
+     *    (no truncation, no silent match) */
+    {
+        char req[256];
+        char val[80];
+        memset(val, 'v', 64);
+        val[64] = '\0';
+        snprintf(req, sizeof(req),
+                 "GET /users/%s HTTP/1.1\r\nHost: t\r\n"
+                 "Authorization: Bearer x\r\n\r\n",
+                 val);
+        n = get(req, rsp, sizeof(rsp));
+        CHECK(n > 0);
+        CHECK(strncmp(rsp, "HTTP/1.1 404", 12) == 0);
+    }
+
+    /* 9) many segments: no route shape matches -> 404, no crash */
+    {
+        char req[512];
+        strcpy(req, "GET /seg");
+        for (int i = 0; i < 50; i++) {
+            strcat(req, "/a");
+        }
+        strcat(req, " HTTP/1.1\r\nHost: t\r\n\r\n");
+        n = get(req, rsp, sizeof(rsp));
+        CHECK(n > 0);
+        CHECK(strncmp(rsp, "HTTP/1.1 404", 12) == 0);
+    }
+
+    /* --- method semantics on param routes --- */
+
+    /* 10) wrong method -> 405 with BOTH methods in Allow
+     *    (Authorization needed — otherwise the middleware 401s first) */
+    n = get("POST /users/42 HTTP/1.1\r\nHost: t\r\n"
+            "Authorization: Bearer x\r\nContent-Length: 0\r\n\r\n",
+            rsp, sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 405", 12) == 0);
+    CHECK(strstr(rsp, "Allow: GET, DELETE") != NULL);
+
+    /* 11) DELETE binds params too */
+    n = get("DELETE /users/7 HTTP/1.1\r\nHost: t\r\n"
+            "Authorization: Bearer x\r\n\r\n",
+            rsp, sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 200", 12) == 0);
+    CHECK(strstr(rsp, "\r\n\r\nid=7 name=-") != NULL);
+
+    /* 12) HEAD falls back to GET and binds params, no body */
+    n = get("HEAD /users/42 HTTP/1.1\r\nHost: t\r\n"
+            "Authorization: Bearer x\r\n\r\n",
+            rsp, sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 200", 12) == 0);
+    CHECK(strstr(rsp, "Content-Length: 12") != NULL); /* "id=42 name=-" */
+    CHECK(strcmp(rsp + strlen(rsp) - 4, "\r\n\r\n") == 0);
+
+    /* --- routing semantics --- */
+
+    /* 13) query string is stripped BEFORE routing -> param binds anyway */
+    n = get("GET /users/42?x=1&y=2 HTTP/1.1\r\nHost: t\r\n"
+            "Authorization: Bearer x\r\n\r\n",
+            rsp, sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 200", 12) == 0);
+    CHECK(strstr(rsp, "\r\n\r\nid=42 name=-") != NULL);
+
+    /* 14) param route wins over the static mount on the same shape */
+    n = get("GET /files/style.css HTTP/1.1\r\nHost: t\r\n\r\n", rsp,
+            sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 200", 12) == 0);
+    CHECK(strstr(rsp, "\r\n\r\nid=- name=style.css") != NULL);
+
+    /* 15) ...but the mount itself keeps working on other paths */
+    n = get("GET /static/style.css HTTP/1.1\r\nHost: t\r\n\r\n", rsp,
+            sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 200", 12) == 0);
+    CHECK(strstr(rsp, "Content-Type: text/css") != NULL);
+    CHECK(strstr(rsp, "\r\n\r\nbody {}") != NULL);
+
+    /* 16) group prefix + params combine */
+    n = get("GET /api/users/9 HTTP/1.1\r\nHost: t\r\n\r\n", rsp, sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 200", 12) == 0);
+    CHECK(strstr(rsp, "\r\n\r\nid=9 name=-") != NULL);
+
+    /* 17) literal route wins over the catch-all (registered earlier) */
+    n = get("GET /exact HTTP/1.1\r\nHost: t\r\n\r\n", rsp, sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 200", 12) == 0);
+    CHECK(strstr(rsp, "\r\n\r\nok") != NULL);
+
+    /* 18) catch-all binds everything else with one segment */
+    n = get("GET /favicon.ico HTTP/1.1\r\nHost: t\r\n\r\n", rsp, sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 200", 12) == 0);
+    CHECK(strstr(rsp, "\r\n\r\nid=favicon.ico name=-") != NULL);
+
+    /* 19) root (0 segments) does NOT match the catch-all (1 segment) */
+    n = get("GET / HTTP/1.1\r\nHost: t\r\n\r\n", rsp, sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strncmp(rsp, "HTTP/1.1 404", 12) == 0);
+
+    /* 20) state reset between requests: params never accumulate or
+     *     leak from a previous request */
+    n = get("GET /users/42 HTTP/1.1\r\nHost: t\r\n"
+            "Authorization: Bearer x\r\n\r\n",
+            rsp, sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strstr(rsp, "\r\n\r\nid=42 name=-") != NULL);
+    n = get("GET /users/43 HTTP/1.1\r\nHost: t\r\n"
+            "Authorization: Bearer x\r\n\r\n",
+            rsp, sizeof(rsp));
+    CHECK(n > 0);
+    CHECK(strstr(rsp, "\r\n\r\nid=43 name=-") != NULL);
+
+    http_stop_server(&g_srv);
+    CHECK(pthread_join(th, NULL) == 0);
+    http_close_server(&g_srv);
+
+    snprintf(p, sizeof(p), "%s/style.css", www);
+    unlink(p);
+    rmdir(www);
+}
+
 int main(void)
 {
     alarm(60); /* watchdog: the test must not hang */
@@ -743,6 +1295,9 @@ int main(void)
     test_group_paths();
     test_integration();
     test_static_files();
+    test_param_registration();
+    test_route_params();
+    test_params_attacks();
 
     return test_report();
 }
