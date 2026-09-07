@@ -108,7 +108,7 @@ cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
 Defined in [`include/c_http.h`](include/c_http.h):
 
 ```c
-#define C_HTTP_VERSION "0.5.0"
+#define C_HTTP_VERSION "0.6.0"
 ```
 
 ## Project structure
