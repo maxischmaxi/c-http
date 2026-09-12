@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 project(c-http
-  VERSION 0.6.0
+  VERSION 0.7.0
   LANGUAGES C
   DESCRIPTION "A minimal HTTP server library in C"
 )
@@ -62,12 +62,13 @@ add_library(c_http STATIC
   src/c_http.c
   src/c_http_encoder.c
   src/c_http_static.c
+  src/c_http_ws.c
 )
 target_include_directories(c_http PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
 )
-target_link_libraries(c_http PUBLIC ZLIB::ZLIB)
+target_link_libraries(c_http PUBLIC ZLIB::ZLIB Threads::Threads)
 target_compile_definitions(c_http PUBLIC _POSIX_C_SOURCE=200809L)
 target_compile_options(c_http PRIVATE
   -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wdouble-promotion
@@ -97,9 +98,11 @@ if(C_HTTP_AMALGAMATE)
       ${CMAKE_CURRENT_SOURCE_DIR}/include/c_http.h
       ${CMAKE_CURRENT_SOURCE_DIR}/include/c_http_assert.h
       ${CMAKE_CURRENT_SOURCE_DIR}/include/c_http_static.h
+      ${CMAKE_CURRENT_SOURCE_DIR}/include/c_http_ws.h
       ${CMAKE_CURRENT_SOURCE_DIR}/src/c_http.c
       ${CMAKE_CURRENT_SOURCE_DIR}/src/c_http_encoder.c
       ${CMAKE_CURRENT_SOURCE_DIR}/src/c_http_static.c
+      ${CMAKE_CURRENT_SOURCE_DIR}/src/c_http_ws.c
       ${CMAKE_CURRENT_SOURCE_DIR}/scripts/amalgamate.py
     COMMENT "Generating single-header amalgamation"
   )
@@ -131,6 +134,11 @@ if(C_HTTP_IS_TOPLEVEL AND C_HTTP_BUILD_TESTS)
   target_link_libraries(test_http PRIVATE c_http Threads::Threads)
   c_http_apply_options(test_http)
   add_test(NAME http COMMAND test_http)
+
+  add_executable(test_ws tests/test_websockets.c)
+  target_link_libraries(test_ws PRIVATE c_http Threads::Threads)
+  c_http_apply_options(test_ws)
+  add_test(NAME ws COMMAND test_ws)
 endif()
 
 # ---------------------------------------------------------------------------

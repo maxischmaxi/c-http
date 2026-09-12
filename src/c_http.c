@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <netdb.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -21,6 +22,7 @@
 
 #include "c_http_assert.h"
 #include "c_http_static.h"
+#include "c_http_ws.h"
 
 /* Time window for a client request (recv AND send); after that the
  * client counts as dead. Protects the single-threaded server against
@@ -301,7 +303,7 @@ static const char *method_name(HttpMethod m)
     return "UNKNOWN";
 }
 
-static bool parse_route_segments(const char *pattern, HttpRouteSegments *out)
+bool http_parse_route_segments(const char *pattern, HttpRouteSegments *out)
 {
     HttpRouteSegments segments = {0};
     segments.segments = malloc(8 * sizeof(HttpRouteSegment));
@@ -371,20 +373,29 @@ static bool parse_route_segments(const char *pattern, HttpRouteSegments *out)
  * copied into it (params->count is only set on a full match — a failed
  * route attempt must not leave dirty state behind for the next route).
  * Returns true = match, false = no match. */
-static bool segments_match(const HttpRouteSegments *pattern,
-                           const HttpRouteSegments *request, HttpParams *params)
+/* Matches a parsed route pattern against request segments[offset..].
+ * A ":name" segment binds any single non-empty request segment.
+ * If params is non-NULL AND the route matches, the bound values are
+ * copied into it (params->count is only set on a full match — a failed
+ * route attempt must not leave dirty state behind for the next route).
+ * offset supports mounted routers: the mount prefix consumed the
+ * first segments already, the router's relative pattern matches the
+ * rest. Returns true = match, false = no match. */
+static bool segments_match_at(const HttpRouteSegments *pattern,
+                              const HttpRouteSegments *request, size_t offset,
+                              HttpParams *params)
 {
-    if (pattern == NULL || request == NULL) {
+    if (pattern == NULL || request == NULL || offset > request->count) {
         return false;
     }
-    if (pattern->count != request->count) {
+    if (pattern->count != request->count - offset) {
         return false; /* different segment count -> clean "no match" */
     }
 
     size_t param_count = 0;
     for (size_t i = 0; i < pattern->count; i++) {
         const HttpRouteSegment *pat = &pattern->segments[i];
-        const HttpRouteSegment *cur = &request->segments[i];
+        const HttpRouteSegment *cur = &request->segments[offset + i];
 
         if (pat->is_param) {
             if (params == NULL) {
@@ -413,6 +424,12 @@ static bool segments_match(const HttpRouteSegments *pattern,
         params->count = param_count; /* commit only on a full match */
     }
     return true;
+}
+
+bool http_segments_match(const HttpRouteSegments *pattern,
+                         const HttpRouteSegments *request, HttpParams *params)
+{
+    return segments_match_at(pattern, request, 0, params);
 }
 
 /*
@@ -664,11 +681,19 @@ static int open_regular_file(const char *path)
 
 #ifdef __linux__
 #include <sys/sendfile.h>
-/* Streams size bytes from file_fd to the socket. Exactly size — never
- * more (Content-Length is promised) and never fewer (otherwise the
- * client would wait for the rest). */
-static int send_fd(int file_fd, off_t size, int client_fd)
+/* Streams size bytes from file_fd (starting at byte offset `start`)
+ * to the socket. Exactly size — never more (Content-Length is
+ * promised) and never fewer (otherwise the client would wait for the
+ * rest). */
+static int send_fd(int file_fd, off_t start, off_t size, int client_fd)
 {
+    /* Range: position the fd first (whole-file sends start at 0). */
+    if (start > 0) {
+        if (lseek(file_fd, start, SEEK_SET) < 0) {
+            return -1;
+        }
+    }
+
     /* Linux sendfile accepts at most 0x7ffff000 bytes per call. */
     const off_t MAX_CHUNK = 0x7ffff000;
     off_t sent_total = 0;
@@ -694,10 +719,19 @@ static int send_fd(int file_fd, off_t size, int client_fd)
 }
 
 #else
-/* Portable fallback (macOS/BSD): read loop with an exact bound. */
-static int send_fd(int file_fd, off_t size, int client_fd)
+/* Streams size bytes from file_fd (starting at byte offset `start`)
+ * to the socket. Portable fallback (macOS/BSD): read loop, exact
+ * bound. */
+static int send_fd(int file_fd, off_t start, off_t size, int client_fd)
 {
     char buf[64 * 1024];
+
+    /* Range: position the fd first (whole-file sends start at 0). */
+    if (start > 0) {
+        if (lseek(file_fd, start, SEEK_SET) < 0) {
+            return -1;
+        }
+    }
     off_t remaining = size;
 
     while (remaining > 0) {
@@ -759,7 +793,31 @@ static void send_res(HttpResponse *res, int client_fd, bool suppress_body)
             res->body_len = 0;
         }
     }
+
+    /* Single-range responses (RFC 9110 §14.2): validate the handler's
+     * range against the ACTUAL file size and clamp the length — the
+     * handler computed it microseconds ago against its own stat, but
+     * a file that shrank in between must never send beyond EOF. A
+     * start beyond the file (extreme shrink case) degenerates to a
+     * 416 with an empty body. */
     bool streaming = file_fd >= 0;
+
+    off_t send_offset = 0;
+    off_t send_size = file_size;
+    if (streaming && res->ranged) {
+        if ((off_t)res->range_start >= file_size) {
+            xclose_fd(file_fd);
+            file_fd = -1;
+            res->status = HTTP_STATUS_RANGE_NOT_SATISFIABLE;
+            res->body_len = 0;
+        } else {
+            send_offset = (off_t)res->range_start;
+            off_t available = file_size - send_offset;
+            send_size = (off_t)res->range_len < available
+                            ? (off_t)res->range_len
+                            : available; /* clamp: never past EOF */
+        }
+    }
 
     size_t body_len =
         res->encoded_body != NULL ? res->encoded_body_len : res->body_len;
@@ -787,7 +845,7 @@ static void send_res(HttpResponse *res, int client_fd, bool suppress_body)
         char content_length[64]; /* large enough for any size_t */
         size_t cl = body_len;
         if (streaming) {
-            cl = (size_t)file_size;
+            cl = (size_t)send_size; /* ranged: exactly the slice length */
         }
         int cl_len = snprintf(content_length, sizeof(content_length),
                               "Content-Length: %zu\r\n", cl);
@@ -851,7 +909,7 @@ static void send_res(HttpResponse *res, int client_fd, bool suppress_body)
 
     if (!no_body_status && !suppress_body) {
         if (streaming) {
-            (void)send_fd(file_fd, file_size, client_fd);
+            (void)send_fd(file_fd, send_offset, send_size, client_fd);
         } else {
             (void)send_all(client_fd, body, body_len);
         }
@@ -862,6 +920,120 @@ out:
     free_encoded_body(res);
     free(res->file_path);
     res->file_path = NULL;
+}
+
+/* ============================================================
+ * Query string parsing
+ * ============================================================ */
+
+static int hex_val(char c)
+{
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return -1;
+}
+
+/* Percent-decodes the bounded range [in, in + in_len) into out.
+ * Query-string semantics: '+' decodes to ' ' (application/
+ * x-www-form-urlencoded in query strings, WHATWG URL). Returns
+ * 0 = OK, -1 = does not fit / broken escape / %00 / control char. */
+static int query_decode(const char *in, size_t in_len, char *out,
+                        size_t out_size)
+{
+    if (in == NULL || out == NULL || out_size == 0) {
+        return -1;
+    }
+
+    size_t o = 0;
+    for (size_t i = 0; i < in_len; i++) {
+        if (o + 1 >= out_size) {
+            return -1; /* truncation, not overflow */
+        }
+        if (in[i] == '%') {
+            if (i + 2 >= in_len) {
+                return -1; /* truncated escape (%z, trailing %) */
+            }
+            int hi = hex_val(in[i + 1]);
+            int lo = hex_val(in[i + 2]);
+            if (hi < 0 || lo < 0) {
+                return -1; /* broken escape */
+            }
+            /* Decoded bytes are checked too: %00 (NUL injection) and
+             * %01-%1f/%7f (control chars) are rejected, regardless of
+             * whether they arrived raw or via an escape. */
+            unsigned char decoded = (unsigned char)((hi * 16) + lo);
+            if (decoded < 0x20 || decoded == 0x7f) {
+                return -1;
+            }
+            out[o++] = (char)decoded;
+            i += 2;
+        } else if (in[i] == '+') {
+            out[o++] = ' ';
+        } else {
+            unsigned char c = (unsigned char)in[i];
+            if (c < 0x20 || c == 0x7f) {
+                return -1; /* no control characters in decoded values */
+            }
+            out[o++] = in[i];
+        }
+    }
+    out[o] = '\0';
+    return 0;
+}
+
+/* Parses "a=1&b=two&flag" into out. Pairs that do not fit (too many,
+ * key/value too long) or are malformed (%00, control chars) are
+ * SKIPPED, never fatal: the query is advisory data, not routing input.
+ * A key without '=' ("flag") gets the empty string as its value. */
+static void parse_query(const char *query, HttpQuery *out)
+{
+    out->count = 0;
+    if (query == NULL) {
+        return;
+    }
+
+    const char *p = query;
+    while (*p != '\0' && out->count < HTTP_MAX_QUERY) {
+        const char *key_start = p;
+        while (*p != '\0' && *p != '&' && *p != '=') {
+            p++;
+        }
+        size_t key_len = (size_t)(p - key_start);
+
+        const char *val_start = p;
+        size_t val_len = 0;
+        if (*p == '=') {
+            val_start = ++p;
+            while (*p != '\0' && *p != '&') {
+                p++;
+            }
+            val_len = (size_t)(p - val_start);
+        }
+
+        /* An empty key ("=5", "&&") is not a pair; oversized or
+         * malformed pairs are skipped whole — never truncated. */
+        if (key_len > 0) {
+            char key[HTTP_QUERY_KEY_MAX];
+            char value[HTTP_QUERY_VALUE_MAX];
+            if (query_decode(key_start, key_len, key, sizeof(key)) == 0 &&
+                query_decode(val_start, val_len, value, sizeof(value)) == 0) {
+                HttpQueryParam *param = &out->params[out->count++];
+                strcpy(param->key, key);
+                strcpy(param->value, value);
+            }
+        }
+
+        if (*p == '&') {
+            p++;
+        }
+    }
 }
 
 /* Parse a request line: "METHOD SP request-target SP HTTP-version".
@@ -891,9 +1063,12 @@ static int parse_request_line(char *line, HttpRequest *req)
     }
     *sp = '\0';
 
-    /* Split off the query string: "/users?id=1" -> "/users" */
+    /* Split off the query string: "/users?id=1" -> "/users". Parse it
+     * BEFORE the '\0' — it is the request's query data, not routing
+     * input, and the raw copy dies with the terminator. */
     char *query = strchr(target, '?');
     if (query != NULL) {
+        parse_query(query + 1, &req->query);
         *query = '\0';
     }
 
@@ -1072,12 +1247,77 @@ static int read_body(int client_fd, char *buf, size_t total, size_t header_end,
     return 0;
 }
 
-static void apply_default_headers(HttpResponse *res, HttpServer *server)
+/* Replaces the value of an existing header (frees the old one) or
+ * appends when absent — used for the per-request Connection header,
+ * which must never exist twice. */
+static int replace_header(HttpHeaders *headers, const char *key,
+                          const char *value)
+{
+    for (size_t i = 0; i < headers->count; i++) {
+        if (strcasecmp(headers->items[i].key, key) == 0) {
+            char *copy = strdup(value);
+            if (copy == NULL) {
+                return -1;
+            }
+            free(headers->items[i].value);
+            headers->items[i].value = copy;
+            return 0;
+        }
+    }
+    return apply_header(headers, key, value);
+}
+
+/* True when a comma-separated header value contains the token
+ * (case-insensitive, RFC 9110 §5.6.2). */
+static bool header_contains_token(const char *value, const char *token)
+{
+    size_t tlen = strlen(token);
+    const char *p = value;
+
+    while (*p != '\0') {
+        while (*p == ' ' || *p == '\t' || *p == ',') {
+            p++;
+        }
+        const char *start = p;
+        while (*p != '\0' && *p != ',') {
+            p++;
+        }
+        size_t len = (size_t)(p - start);
+        while (len > 0 && (start[len - 1] == ' ' || start[len - 1] == '\t')) {
+            len--;
+        }
+        if (len == tlen && strncasecmp(start, token, len) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* RFC 9112 §9.3: HTTP/1.1 persists by default, HTTP/1.0 closes by
+ * default; the Connection header overrides either way ("close"
+ * always wins). */
+static bool request_wants_keep_alive(const HttpRequest *req)
+{
+    const char *conn = http_req_header(req, HTTP_HEADER_CONNECTION);
+    if (conn != NULL) {
+        if (header_contains_token(conn, "close")) {
+            return false;
+        }
+        if (header_contains_token(conn, "keep-alive")) {
+            return true;
+        }
+    }
+    return strcmp(req->version, "HTTP/1.1") == 0;
+}
+
+static void apply_default_headers(HttpResponse *res, HttpServer *server,
+                                  bool keep_alive)
 {
     char time_buf[64];
     format_http_date(time_buf, sizeof(time_buf));
     apply_header(&res->headers, HTTP_HEADER_DATE, time_buf);
-    apply_header(&res->headers, HTTP_HEADER_CONNECTION, "close");
+    apply_header(&res->headers, HTTP_HEADER_CONNECTION,
+                 keep_alive ? "keep-alive" : "close");
     char server_name[64];
     int n = snprintf(server_name, sizeof(server_name), "%s/%s",
                      server->server_name, C_HTTP_VERSION);
@@ -1094,7 +1334,6 @@ static void apply_default_headers(HttpResponse *res, HttpServer *server)
                  "strict-origin-when-cross-origin");
     apply_header(&res->headers, HTTP_HEADER_PERMISSIONS_POLICY,
                  "geolocation=(), camera=(), microphone=()");
-    apply_header(&res->headers, HTTP_HEADER_ACCEPT_RANGES, "bytes");
     apply_header(&res->headers, HTTP_HEADER_VARY, "Accept-Encoding");
 }
 
@@ -1129,6 +1368,94 @@ typedef enum {
     HANDLER_NOT_IMPLEMENTED,
 } HandlerResult;
 
+/* ============================================================
+ * Routers (Express-style express.Router + app.use)
+ * ============================================================ */
+
+struct HttpRouter {
+    HttpRoutes routes; /* relative paths ("/dashboard") */
+    bool mounted;      /* ownership passed to the server via http_use() */
+};
+
+typedef struct HttpRouterMount {
+    HttpRouteSegments prefix_segments; /* parsed mount prefix */
+    HttpRouter *router;                /* owned by the server (mount once) */
+    struct HttpRouterMount *next; /* tail-appended: dispatch in mount order */
+} HttpRouterMount;
+
+/* Appends a method name to the Allow header buffer (bounds-checked). */
+static void allow_append(char *allow, size_t size, size_t *used,
+                         const char *name)
+{
+    size_t n = strlen(name);
+    if (*used > 0) {
+        if (*used + 2 + n >= size) {
+            return;
+        }
+        allow[(*used)++] = ',';
+        allow[(*used)++] = ' ';
+    } else if (*used + n >= size) {
+        return;
+    }
+    memcpy(allow + *used, name, n);
+    *used += n;
+    allow[*used] = '\0'; /* the buffer stays terminated at every step
+                          * (the bounds above leave room for the NUL) */
+}
+
+/* True if the request segments START with the mount prefix segments —
+ * a prefix match, NOT the exact-count semantics of segments_match_at
+ * ("/admin" as a mount matches "/admin/dashboard"). Prefix segments
+ * are always literals: http_use() rejects ":params" in prefixes. */
+static bool prefix_segments_match(const HttpRouteSegments *prefix,
+                                  const HttpRouteSegments *req_segments)
+{
+    if (prefix == NULL || req_segments == NULL ||
+        prefix->count > req_segments->count) {
+        return false;
+    }
+    for (size_t i = 0; i < prefix->count; i++) {
+        if (strcmp(prefix->segments[i].text, req_segments->segments[i].text) !=
+            0) {
+            return false;
+        }
+    }
+    return true; /* count 0 ("/" mount) matches everything */
+}
+
+/* Collects the methods of all routes (server routes AND mounted
+ * routers) that match the request path into allow[*used] — shared by
+ * the 405 Allow header and the OPTIONS auto-response. */
+static void collect_allow(HttpServer *server,
+                          const HttpRouteSegments *req_segments, char *allow,
+                          size_t allow_size, size_t *used)
+{
+    for (size_t i = 0; i < server->routes.count; i++) {
+        if (!http_segments_match(&server->routes.routes[i].route_segments,
+                                 req_segments, NULL)) {
+            continue;
+        }
+        allow_append(allow, allow_size, used,
+                     method_name(server->routes.routes[i].method));
+    }
+
+    for (const HttpRouterMount *mount = server->router_mounts; mount != NULL;
+         mount = mount->next) {
+        if (!prefix_segments_match(&mount->prefix_segments, req_segments)) {
+            continue;
+        }
+        size_t offset = mount->prefix_segments.count;
+        for (size_t i = 0; i < mount->router->routes.count; i++) {
+            const HttpRoute *route = &mount->router->routes.routes[i];
+            if (!segments_match_at(&route->route_segments, req_segments, offset,
+                                   NULL)) {
+                continue;
+            }
+            allow_append(allow, allow_size, used, method_name(route->method));
+        }
+    }
+}
+
 static HandlerResult execute_handler(HttpServer *server, HttpRequest *req,
                                      HttpResponse *res,
                                      const HttpRouteSegments *req_segments)
@@ -1147,12 +1474,13 @@ static HandlerResult execute_handler(HttpServer *server, HttpRequest *req,
      * so a failed attempt leaves req->params untouched. */
     for (size_t i = 0; i < server->routes.count; i++) {
         const HttpRoute *route = &server->routes.routes[i];
-        if (!segments_match(&route->route_segments, req_segments, NULL)) {
+        if (!http_segments_match(&route->route_segments, req_segments, NULL)) {
             continue;
         }
         path_exists = true;
         if (route->method == method) {
-            segments_match(&route->route_segments, req_segments, &req->params);
+            http_segments_match(&route->route_segments, req_segments,
+                                &req->params);
             handler = route->handler;
             break;
         }
@@ -1163,13 +1491,80 @@ static HandlerResult execute_handler(HttpServer *server, HttpRequest *req,
     if (handler == NULL && method == HTTP_METHOD_HEAD) {
         for (size_t i = 0; i < server->routes.count; i++) {
             const HttpRoute *route = &server->routes.routes[i];
-            if (!segments_match(&route->route_segments, req_segments, NULL) ||
+            if (!http_segments_match(&route->route_segments, req_segments,
+                                     NULL) ||
                 route->method != HTTP_METHOD_GET) {
                 continue;
             }
-            segments_match(&route->route_segments, req_segments, &req->params);
+            http_segments_match(&route->route_segments, req_segments,
+                                &req->params);
             handler = route->handler;
             break;
+        }
+    }
+
+    /* Mounted routers next, in mount order: server routes win, routers
+     * win over static mounts. Router paths are RELATIVE — the mount
+     * prefix consumed the first segments of the request already. */
+    if (handler == NULL) {
+        const HttpRouterMount *mount = server->router_mounts;
+        while (mount != NULL && handler == NULL) {
+            if (!prefix_segments_match(&mount->prefix_segments, req_segments)) {
+                mount = mount->next;
+                continue;
+            }
+            size_t offset = mount->prefix_segments.count;
+            const HttpRoutes *rr = &mount->router->routes;
+
+            for (size_t i = 0; i < rr->count; i++) {
+                const HttpRoute *route = &rr->routes[i];
+                if (!segments_match_at(&route->route_segments, req_segments,
+                                       offset, NULL)) {
+                    continue;
+                }
+                path_exists = true;
+                if (route->method == method) {
+                    segments_match_at(&route->route_segments, req_segments,
+                                      offset, &req->params);
+                    handler = route->handler;
+                    break;
+                }
+            }
+
+            /* HEAD falls back to GET within this router too (RFC 9110
+             * §9.3.2). */
+            if (handler == NULL && method == HTTP_METHOD_HEAD) {
+                for (size_t i = 0; i < rr->count; i++) {
+                    const HttpRoute *route = &rr->routes[i];
+                    if (route->method != HTTP_METHOD_GET ||
+                        !segments_match_at(&route->route_segments, req_segments,
+                                           offset, NULL)) {
+                        continue;
+                    }
+                    segments_match_at(&route->route_segments, req_segments,
+                                      offset, &req->params);
+                    handler = route->handler;
+                    break;
+                }
+            }
+
+            mount = mount->next;
+        }
+    }
+
+    /* RFC 9110 §9.3.7: OPTIONS without an explicit OPTIONS route gets
+     * an auto-response (204 + Allow) — Express parity. Only when at
+     * least one route (server or router) matches the path; otherwise
+     * the request falls through to the mounts / 404. */
+    if (handler == NULL && method == HTTP_METHOD_OPTIONS) {
+        char allow[128];
+        size_t used = 0;
+        collect_allow(server, req_segments, allow, sizeof(allow), &used);
+        if (used > 0) {
+            allow[used] = '\0';
+            http_set_header(&res->headers, HTTP_HEADER_ALLOW, allow);
+            res->status = HTTP_STATUS_NO_CONTENT; /* 204, no body */
+            return HANDLER_OK;
         }
     }
 
@@ -1192,7 +1587,7 @@ static HandlerResult execute_handler(HttpServer *server, HttpRequest *req,
     return HANDLER_OK;
 }
 
-/* RFC 9110 §15.4.6: a 405 response includes an Allow header */
+/* RFC 9110 §15.4.6: a 405 response includes an Allow header. */
 static void set_allow_header(HttpServer *server,
                              const HttpRouteSegments *req_segments,
                              HttpResponse *res)
@@ -1200,29 +1595,21 @@ static void set_allow_header(HttpServer *server,
     char allow[128];
     size_t used = 0;
 
-    for (size_t i = 0; i < server->routes.count; i++) {
-        if (!segments_match(&server->routes.routes[i].route_segments,
-                            req_segments, NULL)) {
-            continue;
-        }
-        const char *name = method_name(server->routes.routes[i].method);
-        size_t n = strlen(name);
-        if (used > 0) {
-            if (used + 2 + n >= sizeof(allow)) {
-                break;
-            }
-            allow[used++] = ',';
-            allow[used++] = ' ';
-        }
-        memcpy(allow + used, name, n);
-        used += n;
-    }
+    collect_allow(server, req_segments, allow, sizeof(allow), &used);
 
     allow[used] = '\0';
     if (used > 0) {
         http_set_header(&res->headers, HTTP_HEADER_ALLOW, allow);
     }
 }
+
+static void set_protocol_error(HttpResponse *res, int status)
+{
+    res->status = status;
+    res->error = true;
+}
+
+static void parse_multipart(const HttpRequest *req, HttpMultiparts *out);
 
 static void handle_client(HttpServer *server, int client_fd, const char *ip,
                           uint16_t client_port)
@@ -1232,138 +1619,342 @@ static void handle_client(HttpServer *server, int client_fd, const char *ip,
     HTTP_ASSERT(ip != NULL);
     HTTP_ASSERT(server->routes.routes != NULL);
 
-    char buf[4096];
-    bool headers_complete = false;
+    for (;;) { /* keep-alive: one iteration per request on this connection */
+        char buf[4096];
+        bool headers_complete = false;
 
-    /* Read first, allocate later: on read errors there is nothing to
-     * clean up and no response buffer headers that could leak. */
-    ssize_t total =
-        read_request(client_fd, buf, sizeof(buf), &headers_complete);
-    if (total < 0) {
-        return; /* recv error or timeout — just close */
-    }
-    if (total == 0) {
-        return; /* client closed immediately */
-    }
-
-    HttpRequest req = {0};
-    HttpResponse res = {0};
-    apply_default_headers(&res, server);
-
-    /* Every error path jumps to send: a response is ALWAYS sent (no
-     * silent connection close) and cleanup happens ONLY at the end. */
-    if (!headers_complete) {
-        res.status = HTTP_STATUS_REQUEST_HEADER_FIELDS_TOO_LARGE; /* 431 */
-        goto send;
-    }
-
-    {
-        /* Get the body start position BEFORE terminating (empty header
-         * block: eol and marker coincide). */
-        char *sep = strstr(buf, "\r\n\r\n");
-        if (sep == NULL) { /* cannot happen with headers_complete */
-            res.status = HTTP_STATUS_BAD_REQUEST;
-            goto send;
+        /* Read first, allocate later: on read errors there is nothing to
+         * clean up and no response buffer headers that could leak. */
+        ssize_t total =
+            read_request(client_fd, buf, sizeof(buf), &headers_complete);
+        if (total < 0) {
+            return; /* recv error or timeout — just close */
         }
-        size_t header_end = (size_t)(sep - buf) + 4;
-
-        /* Isolate the request line (terminate at the first CRLF), then
-         * parse; parse_headers starts right after it. */
-        char *eol = strstr(buf, "\r\n");
-        if (eol == NULL) {
-            res.status = HTTP_STATUS_BAD_REQUEST;
-            goto send;
+        if (total == 0) {
+            return; /* client closed immediately */
         }
-        *eol = '\0';
 
-        int line_status = parse_request_line(buf, &req);
-        if (line_status != 0) {
-            res.status = line_status;
+        HttpRequest req = {0};
+        HttpResponse res = {0};
+        /* inet_ntop already produced a NUL-terminated string within
+         * sizeof(req.ip) — but snprintf also guards a shorter buffer. */
+        snprintf(req.ip, sizeof(req.ip), "%s", ip);
+        req.client_port = client_port;
+        /* Connection: close first — corrected after parsing decides the
+         * persistence (protocol errors must always close). */
+        apply_default_headers(&res, server, false);
+        bool persist = false;
+        /* Bytes read past the end of the body (e.g. early websocket
+         * frames sent with the handshake) — handed to the WS layer
+         * instead of being dropped with the request buffer. */
+        const char *ws_leftover = NULL;
+        size_t ws_leftover_len = 0;
+
+        /* Every error path jumps to send: a response is ALWAYS sent (no
+         * silent connection close) and cleanup happens ONLY at the end. */
+        if (!headers_complete) {
+            set_protocol_error(&res,
+                               HTTP_STATUS_REQUEST_HEADER_FIELDS_TOO_LARGE);
             goto send;
         }
 
-        int hdr_status = parse_headers(eol + 2, buf + total, &req);
-        if (hdr_status != 0) {
-            res.status = hdr_status;
-            goto send;
+        {
+            /* Get the body start position BEFORE terminating (empty header
+             * block: eol and marker coincide). */
+            char *sep = strstr(buf, "\r\n\r\n");
+            if (sep == NULL) { /* cannot happen with headers_complete */
+                set_protocol_error(&res, HTTP_STATUS_BAD_REQUEST);
+                goto send;
+            }
+            size_t header_end = (size_t)(sep - buf) + 4;
+
+            /* Isolate the request line (terminate at the first CRLF), then
+             * parse; parse_headers starts right after it. */
+            char *eol = strstr(buf, "\r\n");
+            if (eol == NULL) {
+                set_protocol_error(&res, HTTP_STATUS_BAD_REQUEST);
+                goto send;
+            }
+            *eol = '\0';
+
+            int line_status = parse_request_line(buf, &req);
+            if (line_status != 0) {
+                set_protocol_error(&res, line_status);
+                goto send;
+            }
+
+            int hdr_status = parse_headers(eol + 2, buf + total, &req);
+            if (hdr_status != 0) {
+                set_protocol_error(&res, hdr_status);
+                goto send;
+            }
+
+            int body_status =
+                read_body(client_fd, buf, (size_t)total, header_end, &req);
+            if (body_status != 0) {
+                set_protocol_error(&res, body_status);
+                goto send;
+            }
+
+            /* Leftover bytes: with a body they cannot exist (read_body
+             * rejects more bytes than Content-Length), without one they
+             * can only be the start of a websocket stream (pipelined
+             * HTTP requests are a 400 per the keep-alive rules — the
+             * smuggling guard in read_body covers that). */
+            size_t ws_used = header_end + req.body_len;
+            if ((size_t)total > ws_used) {
+                ws_leftover = buf + ws_used;
+                ws_leftover_len = (size_t)total - ws_used;
+            }
         }
 
-        int body_status =
-            read_body(client_fd, buf, (size_t)total, header_end, &req);
-        if (body_status != 0) {
-            res.status = body_status;
-            goto send;
+        /* Eagerly parse urlencoded bodies — the same pair semantics as
+         * the query parser (malformed pairs are skipped, never fatal). */
+        if (http_req_body_type(&req) == HTTP_BODY_URLENCODED) {
+            parse_query(req.body, &req.form);
         }
-    }
 
-    /* RFC 9112 §3.2: Host header mandatory in HTTP/1.1 (debug check) */
+        /* Eagerly parse multipart/form-data (RFC 7578): parts beyond
+         * the limit and malformed parts are skipped, never fatal. */
+        /* False positive: goto-based cleanup (see the keep-alive note
+         * below — LSan-clean over the full test suite). */
+        /* NOLINTNEXTLINE(clang-analyzer-unix.Malloc) */
+        if (http_req_body_type(&req) == HTTP_BODY_MULTIPART) {
+            parse_multipart(&req, &req.multiparts);
+        }
+
+        /* Keep-alive negotiation: RFC 9112 §9.3. replace_header keeps a
+         * single Connection header (apply_header would append a second). */
+        /* False positive: the analyzer cannot track the goto-based
+         * cleanup below; every path frees req.body at the send: label
+         * (LSan-clean over the full suite, incl. keep-alive bodies). */
+        /* NOLINTNEXTLINE(clang-analyzer-unix.Malloc) */
+        if (server->keep_alive && request_wants_keep_alive(&req)) {
+            persist = true;
+        }
+        replace_header(&res.headers, HTTP_HEADER_CONNECTION,
+                       persist ? "keep-alive" : "close");
+
+        /* RFC 9112 §3.2: Host header mandatory in HTTP/1.1 (debug check) */
 #ifndef NDEBUG
-    if (strcmp(req.version, "HTTP/1.1") == 0) {
-        bool has_host = false;
-        for (size_t i = 0; i < req.headers.count; i++) {
-            if (strcasecmp(req.headers.items[i].key, HTTP_HEADER_HOST) == 0) {
-                has_host = true;
+        if (strcmp(req.version, "HTTP/1.1") == 0) {
+            bool has_host = false;
+            for (size_t i = 0; i < req.headers.count; i++) {
+                if (strcasecmp(req.headers.items[i].key, HTTP_HEADER_HOST) ==
+                    0) {
+                    has_host = true;
+                    break;
+                }
+            }
+            HTTP_ASSERT_MSG(has_host,
+                            "RFC 9112 §3.2: Host header mandatory in HTTP/1.1");
+        }
+#endif
+
+        /* Parse the request path into segments ONCE per request (routes
+         * carry their segments pre-parsed from registration time). A parse
+         * failure (bare ':' or an oversized segment) means no route can
+         * match — clean 404. */
+        HttpRouteSegments req_segments = {0};
+        bool req_segments_ok =
+            http_parse_route_segments(req.path, &req_segments);
+
+        if (apply_middleware(server, &req, &res)) {
+            /* Websocket upgrades (RFC 6455): AFTER middleware (auth
+             * guards apply), BEFORE normal routing — a plain GET on
+             * the same path still hits regular routes. The call runs
+             * the WS handler for the connection's whole lifetime and
+             * returns only when the session ended: the connection is
+             * then done (no send_res, no keep-alive). */
+            HttpWsDispatchResult ws_result =
+                http_ws_dispatch(server, &req, &req_segments, client_fd,
+                                 ws_leftover, ws_leftover_len);
+            if (ws_result != WS_DISPATCH_NOT_WS) {
+                free(req.body);
+                http_headers_free(&req.headers);
+                http_headers_free(&res.headers);
+                free(req_segments.segments);
+                return;
+            }
+
+            HandlerResult result =
+                req_segments_ok
+                    ? execute_handler(server, &req, &res, &req_segments)
+                    : HANDLER_NOT_FOUND;
+            switch (result) {
+            case HANDLER_OK:
+                break;
+            case HANDLER_METHOD_NOT_ALLOWED:
+                /* Framework errors: the central error handler (if set)
+                 * formats them at send time. Allow stays set. */
+                set_protocol_error(&res, HTTP_STATUS_METHOD_NOT_ALLOWED);
+                set_allow_header(server, &req_segments, &res);
+                break;
+            case HANDLER_NOT_FOUND:
+                set_protocol_error(&res, HTTP_STATUS_NOT_FOUND);
+                break;
+            case HANDLER_NOT_IMPLEMENTED:
+                set_protocol_error(&res, HTTP_STATUS_NOT_IMPLEMENTED);
                 break;
             }
         }
-        HTTP_ASSERT_MSG(has_host,
-                        "RFC 9112 §3.2: Host header mandatory in HTTP/1.1");
-    }
-#endif
 
-    /* Parse the request path into segments ONCE per request (routes
-     * carry their segments pre-parsed from registration time). A parse
-     * failure (bare ':' or an oversized segment) means no route can
-     * match — clean 404. */
-    HttpRouteSegments req_segments = {0};
-    bool req_segments_ok = parse_route_segments(req.path, &req_segments);
+        free(req_segments.segments); /* fixed-array params need no cleanup */
 
-    if (apply_middleware(server, &req, &res)) {
-        HandlerResult result =
-            req_segments_ok ? execute_handler(server, &req, &res, &req_segments)
-                            : HANDLER_NOT_FOUND;
-        switch (result) {
-        case HANDLER_OK:
-            break;
-        case HANDLER_METHOD_NOT_ALLOWED:
-            res.status = HTTP_STATUS_METHOD_NOT_ALLOWED;
-            set_allow_header(server, &req_segments, &res);
-            break;
-        case HANDLER_NOT_FOUND:
-            res.status = HTTP_STATUS_NOT_FOUND;
-            break;
-        case HANDLER_NOT_IMPLEMENTED:
-            res.status = HTTP_STATUS_NOT_IMPLEMENTED;
-            break;
+    send:
+        if (res.status == 0) {
+            res.status = HTTP_STATUS_INTERNAL_SERVER_ERROR;
         }
+
+        /* RFC 9110 §15: validate the status before sending */
+        HTTP_ASSERT_MSG(
+            is_valid_status_code(res.status),
+            "RFC 9110 §15: status code must be 100-599 before send");
+        HTTP_ASSERT_MSG(res.body_len <= sizeof(res.body),
+                        "body_len exceeds body buffer — buffer overflow");
+
+        /* Central error handling: ONE place formats all framework errors
+         * (http_error() calls, 404/405/501, protocol parse errors). Runs
+         * before http_encode_body, so an error body still gets compressed. */
+        if (res.error && server->error_handler != NULL) {
+            server->error_handler(&req, &res, res.status,
+                                  res.error_message[0] != '\0'
+                                      ? res.error_message
+                                      : status_text(res.status));
+        }
+
+        http_encode_body(server, &req, &res);
+
+        /* RFC 9110 §9.3.2: HEAD responses have no body (the headers match
+         * those of a GET, including Content-Length). */
+        bool suppress_body = strcmp(req.method, "HEAD") == 0;
+        send_res(&res, client_fd, suppress_body);
+
+        printf("%s:%u %s %s -> %d\n", ip, client_port,
+               req.method[0] != '\0' ? req.method : "-", req.path, res.status);
+
+        free(req.body);
+        http_headers_free(&req.headers);
+        http_headers_free(&res.headers);
+
+        if (!persist) {
+            return; /* Connection: close honored — or an error closed it */
+        }
+    } /* keep-alive: read the next request on the same connection */
+}
+
+/* ============================================================
+ * Worker threads (thread-per-connection, bounded)
+ * ============================================================
+ *
+ * Each connection is handled by its own detached worker (up to
+ * ServerArgs.worker_threads). handle_client() is fully self-contained
+ * per connection (request/response on the stack), so the workers need
+ * NO locks around request state — only the active counter is shared.
+ * When the limit is reached, the accept loop handles the connection
+ * itself (graceful degradation, bounded by the socket timeouts). */
+
+typedef struct {
+    pthread_mutex_t lock;
+    pthread_cond_t idle; /* signaled when the active count drops to 0 */
+    size_t active;       /* currently running workers */
+    size_t limit;        /* max concurrent workers */
+} WorkerState;
+
+typedef struct {
+    HttpServer *server;
+    int client_fd;
+    char ip[46]; /* copied: the accept loop's buffer dies */
+    uint16_t client_port;
+} WorkerArgs;
+
+static void *worker_main(void *arg)
+{
+    WorkerArgs *args = arg;
+    handle_client(args->server, args->client_fd, args->ip, args->client_port);
+    xclose_fd(args->client_fd);
+
+    /* Drain protocol for http_close_server(): count down + signal. */
+    WorkerState *ws = args->server->thread_state;
+    if (ws != NULL) {
+        pthread_mutex_lock(&ws->lock);
+        if (ws->active > 0) {
+            ws->active--;
+        }
+        if (ws->active == 0) {
+            pthread_cond_broadcast(&ws->idle);
+        }
+        pthread_mutex_unlock(&ws->lock);
     }
 
-    free(req_segments.segments); /* fixed-array params need no cleanup */
+    free(args);
+    return NULL;
+}
 
-send:
-    if (res.status == 0) {
-        res.status = HTTP_STATUS_INTERNAL_SERVER_ERROR;
+/* Returns true when a worker took over the connection; false when
+ * the limit is reached or on failure — the caller then handles the
+ * connection itself (never rejects: degrade, don't drop). */
+static bool spawn_worker(HttpServer *server, int client_fd, const char *ip,
+                         uint16_t client_port)
+{
+    WorkerState *ws = server->thread_state;
+    if (ws == NULL) {
+        return false; /* iterative mode */
     }
 
-    /* RFC 9110 §15: validate the status before sending */
-    HTTP_ASSERT_MSG(is_valid_status_code(res.status),
-                    "RFC 9110 §15: status code must be 100-599 before send");
-    HTTP_ASSERT_MSG(res.body_len <= sizeof(res.body),
-                    "body_len exceeds body buffer — buffer overflow");
+    WorkerArgs *args = malloc(sizeof(*args));
+    if (args == NULL) {
+        return false; /* OOM: degrade to inline handling */
+    }
+    args->server = server;
+    args->client_fd = client_fd;
+    snprintf(args->ip, sizeof(args->ip), "%s", ip);
+    args->client_port = client_port;
 
-    http_encode_body(server, &req, &res);
+    pthread_mutex_lock(&ws->lock);
+    if (ws->active >= ws->limit) {
+        pthread_mutex_unlock(&ws->lock);
+        free(args);
+        return false; /* at capacity: accept loop handles it inline */
+    }
+    ws->active++;
+    pthread_mutex_unlock(&ws->lock);
 
-    /* RFC 9110 §9.3.2: HEAD responses have no body (the headers match
-     * those of a GET, including Content-Length). */
-    bool suppress_body = strcmp(req.method, "HEAD") == 0;
-    send_res(&res, client_fd, suppress_body);
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, worker_main, args) != 0) {
+        pthread_mutex_lock(&ws->lock);
+        ws->active--;
+        if (ws->active == 0) {
+            pthread_cond_broadcast(&ws->idle);
+        }
+        pthread_mutex_unlock(&ws->lock);
+        free(args);
+        return false;
+    }
 
-    printf("%s:%u %s %s -> %d\n", ip, client_port,
-           req.method[0] != '\0' ? req.method : "-", req.path, res.status);
+    pthread_detach(thread); /* freed via worker_main; close counts down */
+    return true;
+}
 
-    free(req.body);
-    http_headers_free(&req.headers);
-    http_headers_free(&res.headers);
+/* Waits for all workers to finish (http_close_server): the server
+ * struct must stay alive until every connection is drained — workers
+ * reference it. Bounded by the socket timeouts (a stuck client can
+ * hold a worker for at most recv+send timeouts). */
+static void worker_state_free(HttpServer *server)
+{
+    WorkerState *ws = server->thread_state;
+    if (ws == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&ws->lock);
+    while (ws->active > 0) {
+        pthread_cond_wait(&ws->idle, &ws->lock);
+    }
+    pthread_mutex_unlock(&ws->lock);
+    pthread_mutex_destroy(&ws->lock);
+    pthread_cond_destroy(&ws->idle);
+    free(ws);
+    server->thread_state = NULL;
 }
 
 HttpServerResult http_create_server(const ServerArgs *server_args,
@@ -1451,6 +2042,26 @@ HttpServerResult http_create_server(const ServerArgs *server_args,
     http_register_encoder(out, http_gzip_encoder);
     http_register_encoder(out, http_identity_encoder);
 
+    out->keep_alive = server_args->keep_alive;
+    out->thread_state = NULL;
+    if (server_args->worker_threads > 0) {
+        WorkerState *ws = calloc(1, sizeof(*ws));
+        if (ws == NULL) {
+            http_close_server(out); /* deterministic: frees what exists */
+            return SERVER_ERROR;
+        }
+        if (pthread_mutex_init(&ws->lock, NULL) != 0 ||
+            pthread_cond_init(&ws->idle, NULL) != 0) {
+            pthread_mutex_destroy(&ws->lock); /* half-initialized: safe */
+            pthread_cond_destroy(&ws->idle);
+            free(ws);
+            http_close_server(out);
+            return SERVER_ERROR;
+        }
+        ws->limit = server_args->worker_threads;
+        out->thread_state = ws;
+    }
+
     out->port = server_args->port;
     out->bind_addr = server_args->bind_addr;
     out->listening = false;
@@ -1463,6 +2074,11 @@ void http_close_server(HttpServer *server)
     if (server == NULL) {
         return;
     }
+
+    /* Drain the workers BEFORE freeing anything they reference: every
+     * worker holds a live connection with this server struct. Bounded
+     * by the socket timeouts (HTTP_CLIENT_TIMEOUT_SEC per phase). */
+    worker_state_free(server);
 
     /* fd >= 0 instead of fd != 0: fd 0 is a valid socket descriptor. */
     if (server->fd >= 0) {
@@ -1490,6 +2106,23 @@ void http_close_server(HttpServer *server)
     server->encoders.count = server->encoders.capacity = 0;
 
     http_static_mounts_free(server);
+    http_ws_routes_free(server);
+
+    /* Mounted routers: ownership passed to the server on http_use(). */
+    HttpRouterMount *mount = server->router_mounts;
+    while (mount != NULL) {
+        HttpRouterMount *next = mount->next;
+        free(mount->prefix_segments.segments);
+        for (size_t i = 0; i < mount->router->routes.count; i++) {
+            free((void *)mount->router->routes.routes[i].path);
+            free(mount->router->routes.routes[i].route_segments.segments);
+        }
+        free(mount->router->routes.routes);
+        free(mount->router);
+        free(mount);
+        mount = next;
+    }
+    server->router_mounts = NULL;
 
     free(server->server_name);
     server->server_name = NULL;
@@ -1575,29 +2208,22 @@ void http_listen(HttpServer *server)
         inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof(ip));
         uint16_t client_port = ntohs(client_addr.sin_port);
 
+        /* Thread-per-connection when enabled; the accept loop handles
+         * the connection itself in the iterative default and when the
+         * worker limit is reached (degrade, never drop). */
+        if (spawn_worker(server, client_fd, ip, client_port)) {
+            continue; /* the worker owns client_fd now */
+        }
         handle_client(server, client_fd, ip, client_port);
         close(client_fd);
     }
 }
 
-static HttpRouteAddResult http_add_route(HttpServer *server, const char *path,
-                                         HttpHandler handler, HttpMethod method)
+/* Shared route-registration core: server routes AND router routes go
+ * through here (same validation, same ownership rules). */
+static HttpRouteAddResult add_route_to(HttpRoutes *routes, const char *path,
+                                       HttpHandler handler, HttpMethod method)
 {
-    HTTP_ASSERT(server != NULL);
-    HTTP_ASSERT(path != NULL);
-    HTTP_ASSERT_MSG(path[0] == '/',
-                    "RFC 9110 §3.2: route path must start with '/'");
-    HTTP_ASSERT(handler != NULL);
-    HTTP_ASSERT_MSG(server->listening == false,
-                    "cannot add routes while server is listening");
-
-    if (server == NULL || path == NULL || handler == NULL) {
-        return HTTP_ROUTE_ADD_ERROR;
-    }
-    if (path[0] != '/') {
-        return HTTP_ROUTE_ADD_ERROR;
-    }
-
     /* A route longer than HTTP_PATH_MAX can never match (the request
      * path is capped at HTTP_PATH_MAX) — reject immediately. */
     if (strlen(path) >= HTTP_PATH_MAX) {
@@ -1610,20 +2236,19 @@ static HttpRouteAddResult http_add_route(HttpServer *server, const char *path,
         return HTTP_ROUTE_ADD_ERROR;
     }
 
-    if (server->routes.count == server->routes.capacity) {
-        size_t new_cap = server->routes.capacity * 2;
-        HttpRoute *tmp =
-            realloc(server->routes.routes, new_cap * sizeof(HttpRoute));
+    if (routes->count == routes->capacity) {
+        size_t new_cap = routes->capacity == 0 ? 8 : routes->capacity * 2;
+        HttpRoute *tmp = realloc(routes->routes, new_cap * sizeof(HttpRoute));
         if (tmp == NULL) {
             return HTTP_ROUTE_ADD_ERROR;
         }
-        server->routes.routes = tmp;
-        server->routes.capacity = new_cap;
+        routes->routes = tmp;
+        routes->capacity = new_cap;
     }
 
-    for (size_t i = 0; i < server->routes.count; i++) {
-        if (server->routes.routes[i].method == method &&
-            strcmp(server->routes.routes[i].path, path) == 0) {
+    for (size_t i = 0; i < routes->count; i++) {
+        if (routes->routes[i].method == method &&
+            strcmp(routes->routes[i].path, path) == 0) {
             return HTTP_ROUTE_ADD_CONFLICT;
         }
     }
@@ -1636,12 +2261,12 @@ static HttpRouteAddResult http_add_route(HttpServer *server, const char *path,
     /* Write directly into the array slot (no intermediate struct copy):
      * count is only incremented on success, so a failure leaves the
      * routes array untouched. */
-    HttpRoute *slot = &server->routes.routes[server->routes.count];
+    HttpRoute *slot = &routes->routes[routes->count];
     slot->path = owned_path;
     slot->handler = handler;
     slot->method = method;
-    if (!parse_route_segments(owned_path, &slot->route_segments)) {
-        free(owned_path); /* FIX: leaked the owned path on parse failure */
+    if (!http_parse_route_segments(owned_path, &slot->route_segments)) {
+        free(owned_path);
         return HTTP_ROUTE_ADD_ERROR;
     }
 
@@ -1674,9 +2299,30 @@ static HttpRouteAddResult http_add_route(HttpServer *server, const char *path,
         }
     }
 
-    server->routes.count++; /* slot is complete — commit */
+    routes->count++; /* slot is complete — commit */
 
     return HTTP_ROUTE_ADD_OK;
+}
+
+static HttpRouteAddResult http_add_route(HttpServer *server, const char *path,
+                                         HttpHandler handler, HttpMethod method)
+{
+    HTTP_ASSERT(server != NULL);
+    HTTP_ASSERT(path != NULL);
+    HTTP_ASSERT_MSG(path[0] == '/',
+                    "RFC 9110 §3.2: route path must start with '/'");
+    HTTP_ASSERT(handler != NULL);
+    HTTP_ASSERT_MSG(server->listening == false,
+                    "cannot add routes while server is listening");
+
+    if (server == NULL || path == NULL || handler == NULL) {
+        return HTTP_ROUTE_ADD_ERROR;
+    }
+    if (path[0] != '/') {
+        return HTTP_ROUTE_ADD_ERROR;
+    }
+
+    return add_route_to(&server->routes, path, handler, method);
 }
 
 HttpRouteAddResult http_get(HttpServer *server, const char *path,
@@ -1731,6 +2377,121 @@ HttpRouteAddResult http_options(HttpServer *server, const char *path,
                                 HttpHandler handler)
 {
     return http_add_route(server, path, handler, HTTP_METHOD_OPTIONS);
+}
+
+/* ============================================================
+ * Router implementation (types live above execute_handler)
+ * ============================================================ */
+
+HttpRouter *http_router_create(void)
+{
+    return calloc(1, sizeof(HttpRouter));
+}
+
+void http_router_free(HttpRouter *router)
+{
+    if (router == NULL) {
+        return;
+    }
+    HTTP_ASSERT_MSG(router->mounted == false,
+                    "router is mounted: its ownership passed to the server");
+    if (router->mounted) {
+        return; /* release-build guard: never free server-owned memory */
+    }
+    for (size_t i = 0; i < router->routes.count; i++) {
+        free((void *)router->routes.routes[i].path);
+        free(router->routes.routes[i].route_segments.segments);
+    }
+    free(router->routes.routes);
+    free(router);
+}
+
+#define DEFINE_ROUTER_ROUTE(fn_name, method)                         \
+    HttpRouteAddResult fn_name(HttpRouter *router, const char *path, \
+                               HttpHandler handler)                  \
+    {                                                                \
+        HTTP_ASSERT(router != NULL);                                 \
+        HTTP_ASSERT_MSG(path != NULL && path[0] == '/',              \
+                        "router route path must start with '/'");    \
+        HTTP_ASSERT(handler != NULL);                                \
+        if (router == NULL || path == NULL || handler == NULL) {     \
+            return HTTP_ROUTE_ADD_ERROR;                             \
+        }                                                            \
+        if (path[0] != '/') {                                        \
+            return HTTP_ROUTE_ADD_ERROR;                             \
+        }                                                            \
+        return add_route_to(&router->routes, path, handler, method); \
+    }
+
+DEFINE_ROUTER_ROUTE(http_router_get, HTTP_METHOD_GET)
+DEFINE_ROUTER_ROUTE(http_router_post, HTTP_METHOD_POST)
+DEFINE_ROUTER_ROUTE(http_router_put, HTTP_METHOD_PUT)
+DEFINE_ROUTER_ROUTE(http_router_patch, HTTP_METHOD_PATCH)
+DEFINE_ROUTER_ROUTE(http_router_delete, HTTP_METHOD_DELETE)
+DEFINE_ROUTER_ROUTE(http_router_head, HTTP_METHOD_HEAD)
+DEFINE_ROUTER_ROUTE(http_router_options, HTTP_METHOD_OPTIONS)
+DEFINE_ROUTER_ROUTE(http_router_trace, HTTP_METHOD_TRACE)
+DEFINE_ROUTER_ROUTE(http_router_connect, HTTP_METHOD_CONNECT)
+
+HttpUseResult http_use(HttpServer *server, const char *prefix,
+                       HttpRouter *router)
+{
+    HTTP_ASSERT(server != NULL);
+    HTTP_ASSERT(prefix != NULL);
+    HTTP_ASSERT_MSG(prefix[0] == '/',
+                    "router mount prefix must start with '/'");
+    HTTP_ASSERT(router != NULL);
+    HTTP_ASSERT_MSG(server->listening == false,
+                    "cannot mount a router while listening");
+    HTTP_ASSERT_MSG(router->mounted == false,
+                    "router is already mounted (ownership passes to the "
+                    "server on http_use)");
+
+    if (server == NULL || prefix == NULL || router == NULL) {
+        return HTTP_USE_ERROR;
+    }
+    if (prefix[0] != '/' || router->mounted) {
+        return HTTP_USE_ERROR;
+    }
+    /* A prefix longer than HTTP_PATH_MAX can never match. */
+    if (strlen(prefix) >= HTTP_PATH_MAX) {
+        return HTTP_USE_ERROR;
+    }
+    /* A '?' can never match: the query string is stripped before
+     * routing (same rule as for route patterns). */
+    if (strchr(prefix, '?') != NULL) {
+        return HTTP_USE_ERROR;
+    }
+
+    HttpRouterMount *mount = calloc(1, sizeof(*mount));
+    if (mount == NULL) {
+        return HTTP_USE_ERROR;
+    }
+    if (!http_parse_route_segments(prefix, &mount->prefix_segments)) {
+        free(mount);
+        return HTTP_USE_ERROR;
+    }
+    /* The mount prefix is a fixed location: ":params" in it are
+     * rejected (they would never bind anything meaningful). */
+    for (size_t i = 0; i < mount->prefix_segments.count; i++) {
+        if (mount->prefix_segments.segments[i].is_param) {
+            free(mount->prefix_segments.segments);
+            free(mount);
+            return HTTP_USE_ERROR;
+        }
+    }
+
+    mount->router = router;
+    router->mounted = true;
+
+    /* Append at the TAIL: routers dispatch in mount order (Express
+     * semantics — first mounted is checked first). */
+    HttpRouterMount **tail = (HttpRouterMount **)&server->router_mounts;
+    while (*tail != NULL) {
+        tail = &(*tail)->next;
+    }
+    *tail = mount;
+    return HTTP_USE_OK;
 }
 
 HttpMiddlewareAddResult http_middleware(HttpServer *server, const char *path,
@@ -1869,6 +2630,977 @@ HttpMiddlewareAddResult http_group_middleware(HttpGroup *group,
         return HTTP_MIDDLEWARE_ADD_ERROR;
     }
     return http_middleware(group->server, full, handler);
+}
+
+const char *http_req_header(const HttpRequest *req, const char *key)
+{
+    if (req == NULL || key == NULL) {
+        return NULL;
+    }
+    /* RFC 9110 §5.1: field names are case-insensitive — compare with
+     * strcasecmp, return the FIRST occurrence. */
+    for (size_t i = 0; i < req->headers.count; i++) {
+        if (strcasecmp(req->headers.items[i].key, key) == 0) {
+            return req->headers.items[i].value;
+        }
+    }
+    return NULL;
+}
+
+const char *http_req_query(const HttpRequest *req, const char *key)
+{
+    if (req == NULL || key == NULL) {
+        return NULL;
+    }
+    /* First occurrence wins — consistent with http_req_header(). */
+    for (size_t i = 0; i < req->query.count; i++) {
+        if (strcmp(key, req->query.params[i].key) == 0) {
+            return req->query.params[i].value;
+        }
+    }
+    return NULL;
+}
+
+HttpSetLocalResult http_set_local(HttpResponse *res, const char *key,
+                                  const char *value)
+{
+    if (res == NULL || key == NULL || value == NULL || key[0] == '\0') {
+        return HTTP_SET_LOCAL_ERROR;
+    }
+    if (strlen(key) >= HTTP_LOCAL_KEY_MAX ||
+        strlen(value) >= HTTP_LOCAL_VALUE_MAX) {
+        return HTTP_SET_LOCAL_ERROR;
+    }
+
+    /* Locals carry the latest state: setting an existing key
+     * overwrites (e.g. a second middleware refines the first). */
+    for (size_t i = 0; i < res->locals.count; i++) {
+        if (strcmp(res->locals.locals[i].key, key) == 0) {
+            snprintf(res->locals.locals[i].value,
+                     sizeof(res->locals.locals[i].value), "%s", value);
+            return HTTP_SET_LOCAL_OK;
+        }
+    }
+
+    if (res->locals.count >= HTTP_MAX_LOCALS) {
+        return HTTP_SET_LOCAL_ERROR; /* fixed slots are full */
+    }
+    HttpLocal *local = &res->locals.locals[res->locals.count++];
+    snprintf(local->key, sizeof(local->key), "%s", key);
+    snprintf(local->value, sizeof(local->value), "%s", value);
+    return HTTP_SET_LOCAL_OK;
+}
+
+const char *http_res_local(const HttpResponse *res, const char *key)
+{
+    if (res == NULL || key == NULL) {
+        return NULL;
+    }
+    for (size_t i = 0; i < res->locals.count; i++) {
+        if (strcmp(key, res->locals.locals[i].key) == 0) {
+            return res->locals.locals[i].value;
+        }
+    }
+    return NULL;
+}
+
+/* ============================================================
+ * Response helpers
+ * ============================================================ */
+
+int http_res_json(HttpResponse *res, int status, const char *body)
+{
+    if (res == NULL || body == NULL || !is_valid_status_code(status)) {
+        return -1;
+    }
+    size_t len = strlen(body);
+    if (len >= sizeof(res->body)) {
+        return -1; /* caller must chunk/reduce — never truncate JSON */
+    }
+    if (http_set_header(&res->headers, HTTP_HEADER_CONTENT_TYPE,
+                        "application/json") != HTTP_SET_HEADER_OK) {
+        return -1;
+    }
+    memcpy(res->body, body, len);
+    res->body[len] = '\0';
+    res->body_len = len;
+    res->status = status;
+    return 0;
+}
+
+int http_res_redirect(HttpResponse *res, int status, const char *location)
+{
+    if (res == NULL || location == NULL) {
+        return -1;
+    }
+    if (status < 300 || status > 399) {
+        return -1; /* redirects are 3xx only */
+    }
+    /* http_set_header rejects CR/LF injection in the location. */
+    if (http_set_header(&res->headers, HTTP_HEADER_LOCATION, location) !=
+        HTTP_SET_HEADER_OK) {
+        return -1;
+    }
+    res->status = status;
+    res->body_len = 0; /* empty body: the Location carries the semantics */
+    return 0;
+}
+
+int http_res_cookie(HttpResponse *res, const char *name, const char *value,
+                    unsigned max_age, bool http_only)
+{
+    if (res == NULL || name == NULL || value == NULL || name[0] == '\0') {
+        return -1;
+    }
+    /* cookie-name is a token (RFC 6265 §4.1.1): separators rejected. */
+    if (strpbrk(name, ";= \t") != NULL) {
+        return -1;
+    }
+    /* A ';' in the value would start a forged attribute — reject
+     * instead of splitting (CR/LF is caught by http_set_header). */
+    if (strchr(value, ';') != NULL) {
+        return -1;
+    }
+
+    char cookie[512];
+    size_t used =
+        (size_t)snprintf(cookie, sizeof(cookie), "%s=%s; Path=/", name, value);
+    if (used >= sizeof(cookie)) {
+        return -1;
+    }
+    if (max_age > 0) {
+        int n = snprintf(cookie + used, sizeof(cookie) - used, "; Max-Age=%u",
+                         max_age);
+        if (n < 0 || used + (size_t)n >= sizeof(cookie)) {
+            return -1;
+        }
+        used += (size_t)n;
+    }
+    if (http_only) {
+        int n = snprintf(cookie + used, sizeof(cookie) - used, "; HttpOnly");
+        if (n < 0 || used + (size_t)n >= sizeof(cookie)) {
+            return -1;
+        }
+        used += (size_t)n;
+    }
+    (void)used;
+
+    /* Multiple Set-Cookie headers are legal — http_set_header appends. */
+    return http_set_header(&res->headers, HTTP_HEADER_SET_COOKIE, cookie) ==
+                   HTTP_SET_HEADER_OK
+               ? 0
+               : -1;
+}
+
+/* ============================================================
+ * Central error handling
+ * ============================================================ */
+
+void http_error(HttpResponse *res, int status, const char *message)
+{
+    if (res == NULL) {
+        return;
+    }
+    /* Only 4xx/5xx are errors: anything else is a caller bug and gets
+     * the generic 500 instead of silently sending a success status. */
+    if (!is_valid_status_code(status) || status < 400) {
+        status = HTTP_STATUS_INTERNAL_SERVER_ERROR;
+    }
+    res->status = status;
+    res->error = true;
+    snprintf(res->error_message, sizeof(res->error_message), "%s",
+             message != NULL ? message : status_text(status));
+}
+
+/* ============================================================
+ * Body parsers
+ * ============================================================ */
+
+const char *http_req_form(const HttpRequest *req, const char *key)
+{
+    if (req == NULL || key == NULL) {
+        return NULL;
+    }
+    /* First occurrence wins — consistent with http_req_query(). */
+    for (size_t i = 0; i < req->form.count; i++) {
+        if (strcmp(key, req->form.params[i].key) == 0) {
+            return req->form.params[i].value;
+        }
+    }
+    return NULL;
+}
+
+HttpBodyType http_req_body_type(const HttpRequest *req)
+{
+    if (req == NULL || req->body == NULL || req->body_len == 0) {
+        return HTTP_BODY_NONE;
+    }
+    const char *ct = http_req_header(req, HTTP_HEADER_CONTENT_TYPE);
+    if (ct == NULL) {
+        return HTTP_BODY_OTHER;
+    }
+    /* Prefix compare: suffixes like "; charset=utf-8" are tolerated. */
+    if (strncasecmp(ct, "application/x-www-form-urlencoded", 33) == 0) {
+        return HTTP_BODY_URLENCODED;
+    }
+    if (strncasecmp(ct, "application/json", 16) == 0) {
+        return HTTP_BODY_JSON;
+    }
+    if (strncasecmp(ct, "multipart/form-data", 19) == 0) {
+        return HTTP_BODY_MULTIPART;
+    }
+    return HTTP_BODY_OTHER;
+}
+
+/* --- minimal JSON scanner (top-level strings only) --- */
+
+static const char *json_skip_ws(const char *p)
+{
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') {
+        p++;
+    }
+    return p;
+}
+
+static int json_hex4(const char *p)
+{
+    int v = 0;
+    for (int i = 0; i < 4; i++) {
+        int h = hex_val(p[i]);
+        if (h < 0) {
+            return -1;
+        }
+        v = (v * 16) + h;
+    }
+    return v;
+}
+
+/* UTF-8 encodes a code point into out. Returns the bytes written
+ * (1-3, \uXXXX caps at 0xFFFF) or -1 on lone surrogates / no room.
+ * A single '\0' byte is NEVER written (JSON strings can carry a
+ * decoded 0x0000 — rejected here to keep values C-safe). */
+static int json_utf8_encode(unsigned cp, char *out, size_t out_size)
+{
+    if (cp >= 0xD800 && cp <= 0xDFFF) {
+        return -1; /* lone surrogate: no pairing support */
+    }
+    if (cp == 0) {
+        return -1; /* keep values NUL-free (C string semantics) */
+    }
+    if (cp < 0x80) {
+        if (out_size < 1) {
+            return -1;
+        }
+        out[0] = (char)cp;
+        return 1;
+    }
+    if (cp < 0x800) {
+        if (out_size < 2) {
+            return -1;
+        }
+        out[0] = (char)(0xC0 | (cp >> 6));
+        out[1] = (char)(0x80 | (cp & 0x3F));
+        return 2;
+    }
+    if (out_size < 3) {
+        return -1;
+    }
+    out[0] = (char)(0xE0 | (cp >> 12));
+    out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    out[2] = (char)(0x80 | (cp & 0x3F));
+    return 3;
+}
+
+/* Decodes the JSON string at the opening quote into out.
+ * Returns the decoded length (0 = empty string) or -1 on malformed
+ * input / out too small (NEVER truncates). end (when non-NULL) ends
+ * up past the closing quote. */
+static int json_decode_string(const char *p, char *out, size_t out_size,
+                              const char **end)
+{
+    if (out == NULL || out_size == 0) {
+        return -1;
+    }
+
+    p++; /* past the opening quote */
+    size_t o = 0;
+    while (*p != '"') {
+        unsigned char c = (unsigned char)*p;
+        if (c < 0x20) {
+            return -1; /* raw control chars are illegal in JSON strings */
+        }
+
+        if (c != '\\') {
+            /* literal byte or raw UTF-8 (JSON allows it) — passthrough */
+            if (o + 1 >= out_size) {
+                return -1; /* no room for this byte + the NUL */
+            }
+            out[o++] = (char)c;
+            p++;
+            continue;
+        }
+
+        /* escape sequence */
+        p++;
+        char simple = 0;
+        switch (*p) {
+        case '"':
+            simple = '"';
+            break;
+        case '\\':
+            simple = '\\';
+            break;
+        case '/':
+            simple = '/';
+            break;
+        case 'b':
+            simple = '\b';
+            break;
+        case 'f':
+            simple = '\f';
+            break;
+        case 'n':
+            simple = '\n';
+            break;
+        case 'r':
+            simple = '\r';
+            break;
+        case 't':
+            simple = '\t';
+            break;
+        case 'u': {
+            int cp = json_hex4(p + 1);
+            if (cp < 0) {
+                return -1;
+            }
+            int n = json_utf8_encode((unsigned)cp, out + o, out_size - o);
+            if (n < 0) {
+                return -1;
+            }
+            o += (size_t)n;
+            p += 4;
+            break;
+        }
+        default:
+            return -1; /* unknown escape */
+        }
+
+        if (simple != 0) {
+            if (o + 1 >= out_size) {
+                return -1;
+            }
+            out[o++] = simple;
+        }
+        p++;
+    }
+
+    out[o] = '\0';
+    if (end != NULL) {
+        *end = p + 1; /* past the closing quote */
+    }
+    return (int)o;
+}
+
+/* Skips one JSON value (string/number/true/false/null/object/array)
+ * starting at p. Returns the position after it, or NULL when
+ * malformed. Depth-bounded: pathological nesting hits the depth cap
+ * instead of exhausting the C stack. */
+/* Deliberate recursive descent, depth-bounded (max 32): a pathological
+ * 50-MB body hits the depth cap long before the C stack is at risk. */
+/* NOLINTBEGIN(misc-no-recursion) */
+static const char *json_skip_value(const char *p, int depth)
+{
+    if (depth < 0) {
+        return NULL;
+    }
+
+    switch (*p) {
+    case '"':
+        p++;
+        while (*p != '"') {
+            if (*p == '\0' || *p == '\n' || *p == '\r') {
+                return NULL;
+            }
+            if (*p == '\\') {
+                p++;
+                if (*p == '\0') {
+                    return NULL;
+                }
+            }
+            p++;
+        }
+        return p + 1;
+
+    case '{':
+        p = json_skip_ws(p + 1);
+        if (*p == '}') {
+            return p + 1;
+        }
+        for (;;) {
+            if (*p != '"') {
+                return NULL; /* member keys are strings */
+            }
+            p = json_skip_value(p, depth - 1);
+            if (p == NULL) {
+                return NULL;
+            }
+            p = json_skip_ws(p);
+            if (*p != ':') {
+                return NULL;
+            }
+            p = json_skip_value(json_skip_ws(p + 1), depth - 1);
+            if (p == NULL) {
+                return NULL;
+            }
+            p = json_skip_ws(p);
+            if (*p == ',') {
+                p = json_skip_ws(p + 1);
+                continue;
+            }
+            if (*p == '}') {
+                return p + 1;
+            }
+            return NULL;
+        }
+
+    case '[':
+        p = json_skip_ws(p + 1);
+        if (*p == ']') {
+            return p + 1;
+        }
+        for (;;) {
+            p = json_skip_value(p, depth - 1);
+            if (p == NULL) {
+                return NULL;
+            }
+            p = json_skip_ws(p);
+            if (*p == ',') {
+                p = json_skip_ws(p + 1);
+                continue;
+            }
+            if (*p == ']') {
+                return p + 1;
+            }
+            return NULL;
+        }
+
+    default:
+        if (strncmp(p, "true", 4) == 0) {
+            return p + 4;
+        }
+        if (strncmp(p, "false", 5) == 0) {
+            return p + 5;
+        }
+        if (strncmp(p, "null", 4) == 0) {
+            return p + 4;
+        }
+        /* number (loose validation: digits . e E + -) */
+        if (*p == '-') {
+            p++;
+        }
+        if (!(*p >= '0' && *p <= '9')) {
+            return NULL;
+        }
+        while ((*p >= '0' && *p <= '9') || *p == '.' || *p == 'e' ||
+               *p == 'E' || *p == '+' || *p == '-') {
+            p++;
+        }
+        return p;
+    }
+}
+
+/* NOLINTEND(misc-no-recursion) */
+int http_req_json_string(const HttpRequest *req, const char *key, char *out,
+                         size_t out_size)
+{
+    if (req == NULL || key == NULL || out == NULL || out_size == 0 ||
+        req->body == NULL || req->body_len == 0) {
+        return -1;
+    }
+
+    const char *p = json_skip_ws(req->body);
+    if (*p != '{') {
+        return -1; /* only top-level objects are supported */
+    }
+    p = json_skip_ws(p + 1);
+    if (*p == '}') {
+        return -1; /* empty object: the key is absent */
+    }
+
+    for (;;) {
+        if (*p != '"') {
+            return -1; /* malformed member key */
+        }
+
+        /* Raw key compare (no escapes in keys — they are identifiers).
+         * kend stops at the closing quote, '\' aborts (unsupported). */
+        const char *kend = p + 1;
+        while (*kend != '"' && *kend != '\\' && *kend != '\0') {
+            kend++;
+        }
+        if (*kend != '"') {
+            return -1;
+        }
+        size_t klen = (size_t)(kend - (p + 1));
+        bool match =
+            (klen == strlen(key) && strncmp(p + 1, key, klen) == 0) != 0;
+
+        p = json_skip_ws(kend + 1);
+        if (*p != ':') {
+            return -1;
+        }
+        p = json_skip_ws(p + 1);
+
+        if (match) {
+            if (*p != '"') {
+                return -1; /* found, but the value is not a string */
+            }
+            return json_decode_string(p, out, out_size, NULL);
+        }
+
+        /* Not our key: skip the whole value (nested structures included). */
+        p = json_skip_value(p, 32);
+        if (p == NULL) {
+            return -1;
+        }
+        p = json_skip_ws(p);
+        if (*p == ',') {
+            p = json_skip_ws(p + 1);
+            continue; /* next member must be a string key */
+        }
+        if (*p == '}') {
+            return -1; /* end of the object: key absent */
+        }
+        return -1; /* malformed */
+    }
+}
+
+/* ============================================================
+ * multipart/form-data (RFC 7578)
+ * ============================================================ */
+
+/* Binary-safe search (memmem is GNU-only). Returns the offset of the
+ * first occurrence or (size_t)-1. */
+static size_t mem_find(const char *hay, size_t hay_len, const char *needle,
+                       size_t needle_len)
+{
+    if (needle_len == 0 || hay_len < needle_len) {
+        return (size_t)-1;
+    }
+    for (size_t i = 0; i + needle_len <= hay_len; i++) {
+        if (memcmp(hay + i, needle, needle_len) == 0) {
+            return i;
+        }
+    }
+    return (size_t)-1;
+}
+
+/* Extracts the boundary parameter from a Content-Type value like
+ * "multipart/form-data; boundary=----X" (quoted or bare).
+ * Returns the copied length, or 0 when absent/malformed/oversized
+ * (RFC 7578: 1-70 bchars). */
+static size_t multipart_boundary(const char *content_type, char *out,
+                                 size_t out_size)
+{
+    if (content_type == NULL || out == NULL || out_size < 2) {
+        return 0;
+    }
+
+    for (const char *p = content_type; *p != '\0'; p++) {
+        if (strncasecmp(p, "boundary=", 9) != 0) {
+            continue;
+        }
+        p += 9;
+        if (*p == '"') { /* quoted boundary */
+            p++;
+        }
+        size_t n = 0;
+        while (*p != '\0' && *p != '"' && *p != ';') {
+            unsigned char c = (unsigned char)*p;
+            /* bchars only: reject control chars, spaces, separators */
+            if (c < 0x20 || c > 0x7e || n + 1 >= out_size) {
+                return 0;
+            }
+            out[n++] = *p++;
+        }
+        out[n] = '\0';
+        return n; /* 0 for an empty boundary = absent */
+    }
+    return 0;
+}
+
+/* Copies a quoted attribute value (name="..."/filename="...") from
+ * a Content-Disposition line region. The attribute must be preceded
+ * by ';' or whitespace — otherwise "name=" would match inside
+ * "filename=". Bounded, NUL-free; overflow rejects the whole value. */
+static void disposition_attr(const char *region, size_t region_len,
+                             const char *attr, char *out, size_t out_size)
+{
+    out[0] = '\0';
+    size_t alen = strlen(attr);
+
+    for (size_t i = 0; i + alen < region_len; i++) {
+        if (strncasecmp(region + i, attr, alen) != 0) {
+            continue;
+        }
+        /* word boundary: preceded by ';', ' ' or '\t' */
+        if (i > 0 && region[i - 1] != ';' && region[i - 1] != ' ' &&
+            region[i - 1] != '\t') {
+            continue;
+        }
+        const char *v = region + i + alen;
+        bool quoted = *v == '"';
+        if (quoted) {
+            v++;
+        }
+        size_t n = 0;
+        while ((size_t)(v - region) < region_len) {
+            char c = *v;
+            if (quoted ? c == '"' : (c == ';' || c == '\r')) {
+                break;
+            }
+            if (c < 0x20 || c > 0x7e || n + 1 >= out_size) {
+                return; /* binary junk/overflow: no value */
+            }
+            out[n++] = c;
+            v++;
+        }
+        if ((quoted && (size_t)(v - region) < region_len && *v == '"') ||
+            (!quoted && n > 0)) {
+            out[n] = '\0';
+        }
+        return; /* first match wins */
+    }
+}
+
+/* Parses one part's header block (Content-Disposition name/filename,
+ * Content-Type). region is binary-safe; lines end at CRLF. */
+static void parse_part_headers(const char *region, size_t region_len,
+                               char *name, size_t name_size, char *filename,
+                               size_t filename_size, char *content_type,
+                               size_t ct_size)
+{
+    name[0] = '\0';
+    filename[0] = '\0';
+    content_type[0] = '\0';
+
+    size_t pos = 0;
+    while (pos < region_len) {
+        size_t eol = mem_find(region + pos, region_len - pos, "\r\n", 2);
+        if (eol == (size_t)-1) {
+            eol = region_len - pos; /* last line without CRLF */
+        }
+        size_t line_len = eol;
+
+        if (line_len > 20 &&
+            strncasecmp(region + pos, "Content-Disposition:", 20) == 0) {
+            disposition_attr(region + pos, line_len, "name=", name, name_size);
+            disposition_attr(region + pos, line_len, "filename=", filename,
+                             filename_size);
+        } else if (line_len > 13 &&
+                   strncasecmp(region + pos, "Content-Type:", 13) == 0) {
+            const char *v = region + pos + 13;
+            size_t n = 0;
+            while ((size_t)(v - (region + pos)) < line_len && *v != ';' &&
+                   n + 1 < ct_size) {
+                if (*v != ' ' && *v != '\t') {
+                    content_type[n++] = *v;
+                }
+                v++;
+            }
+            content_type[n] = '\0';
+        }
+
+        pos += eol + 2; /* past the CRLF */
+    }
+}
+
+/* Parses multipart/form-data parts into out. Malformed parts and
+ * parts without a name attribute are skipped; parsing stops at the
+ * final delimiter or on structural garbage — never fatal. */
+static void parse_multipart(const HttpRequest *req, HttpMultiparts *out)
+{
+    out->count = 0;
+    if (req == NULL || req->body == NULL || req->body_len == 0) {
+        return;
+    }
+
+    const char *ct = http_req_header(req, HTTP_HEADER_CONTENT_TYPE);
+    if (ct == NULL) {
+        return;
+    }
+    char boundary[71];
+    if (multipart_boundary(ct, boundary, sizeof(boundary)) == 0) {
+        return;
+    }
+
+    char delim[74]; /* "--" + boundary */
+    int dlen = snprintf(delim, sizeof(delim), "--%s", boundary);
+    if (dlen <= 2 || (size_t)dlen >= sizeof(delim)) {
+        return;
+    }
+    char close_delim[76]; /* "\r\n" + "--" + boundary */
+    int clen = snprintf(close_delim, sizeof(close_delim), "\r\n%s", delim);
+    if (clen <= 4 || (size_t)clen >= sizeof(close_delim)) {
+        return;
+    }
+
+    const char *body = req->body;
+    size_t body_len = req->body_len;
+
+    /* position right after the FIRST delimiter (the body may start
+     * with it directly — browsers do not send a leading CRLF) */
+    size_t pos = mem_find(body, body_len, delim, (size_t)dlen);
+    if (pos == (size_t)-1) {
+        return;
+    }
+    pos += (size_t)dlen;
+
+    while (pos < body_len && out->count < HTTP_MAX_MULTIPART_PARTS) {
+        /* "--" right after the boundary = the final delimiter */
+        if (pos + 2 <= body_len && body[pos] == '-' && body[pos + 1] == '-') {
+            return;
+        }
+
+        /* after a delimiter: CRLF, then the part headers */
+        if (pos + 2 > body_len || body[pos] != '\r' || body[pos + 1] != '\n') {
+            return; /* structurally malformed: stop */
+        }
+        pos += 2;
+
+        /* the header block ends at the first empty line */
+        size_t hdr_end = mem_find(body + pos, body_len - pos, "\r\n\r\n", 4);
+        if (hdr_end == (size_t)-1) {
+            return; /* unterminated headers: stop */
+        }
+        size_t data_start = pos + hdr_end + 4;
+
+        char name[HTTP_MULTIPART_NAME_MAX];
+        char filename[HTTP_MULTIPART_FILE_MAX];
+        char part_ct[HTTP_MULTIPART_FILE_MAX];
+        parse_part_headers(body + pos, hdr_end + 2, name, sizeof(name),
+                           filename, sizeof(filename), part_ct,
+                           sizeof(part_ct));
+
+        /* the part data ends at the NEXT closing delimiter */
+        size_t data_end = mem_find(body + data_start, body_len - data_start,
+                                   close_delim, (size_t)clen);
+        if (data_end == (size_t)-1) {
+            return; /* missing final delimiter: drop everything open */
+        }
+
+        /* parts without a name attribute are malformed — skip them */
+        if (name[0] != '\0') {
+            HttpMultipartPart *part = &out->parts[out->count++];
+            snprintf(part->name, sizeof(part->name), "%s", name);
+            snprintf(part->filename, sizeof(part->filename), "%s", filename);
+            snprintf(part->content_type, sizeof(part->content_type), "%s",
+                     part_ct);
+            part->data = body + data_start;
+            part->data_len = data_end;
+        }
+
+        /* continue after the closing delimiter (CRLF + "--boundary") */
+        pos = data_start + data_end + 2 + (size_t)dlen;
+    }
+}
+
+size_t http_req_multipart_count(const HttpRequest *req)
+{
+    if (req == NULL) {
+        return 0;
+    }
+    return req->multiparts.count;
+}
+
+const HttpMultipartPart *http_req_multipart_part(const HttpRequest *req,
+                                                 size_t index)
+{
+    if (req == NULL || index >= req->multiparts.count) {
+        return NULL;
+    }
+    return &req->multiparts.parts[index];
+}
+
+const HttpMultipartPart *http_req_multipart_get(const HttpRequest *req,
+                                                const char *name)
+{
+    if (req == NULL || name == NULL) {
+        return NULL;
+    }
+    for (size_t i = 0; i < req->multiparts.count; i++) {
+        if (strcmp(req->multiparts.parts[i].name, name) == 0) {
+            return &req->multiparts.parts[i];
+        }
+    }
+    return NULL;
+}
+
+/* ============================================================
+ * content negotiation (RFC 9110 §12.5.1 Accept)
+ * ============================================================ */
+
+/* Parses ";q=0.5" parameters starting at p (at ';'). Returns q,
+ * default 1.0 for a missing/unparseable value. */
+static double accepts_parse_q(const char **pp)
+{
+    const char *p = *pp;
+    double q = 1.0;
+
+    while (*p == ';') {
+        p++;
+        while (*p == ' ' || *p == '\t') {
+            p++;
+        }
+        if ((p[0] == 'q' || p[0] == 'Q') && p[1] == '=') {
+            char *end = NULL;
+            double v = strtod(p + 2, &end);
+            if (end != p + 2 && v >= 0.0 && v <= 1.0) {
+                q = v;
+            }
+        }
+        while (*p != '\0' && *p != ';' && *p != ',') {
+            p++;
+        }
+    }
+
+    *pp = p;
+    return q;
+}
+
+const char *http_req_accepts(const HttpRequest *req, const char *const *types)
+{
+    if (req == NULL || types == NULL || types[0] == NULL) {
+        return NULL;
+    }
+
+    /* Does an Accept header exist at all? Without one, everything is
+     * acceptable (RFC 9110 §12.5.1) — the first valid offer wins. */
+    bool has_accept = false;
+    for (size_t i = 0; i < req->headers.count; i++) {
+        if (strcasecmp(req->headers.items[i].key, HTTP_HEADER_ACCEPT) == 0) {
+            has_accept = true;
+            break;
+        }
+    }
+    if (!has_accept) {
+        for (size_t t = 0; types[t] != NULL; t++) {
+            if (strchr(types[t], '/') != NULL) {
+                return types[t];
+            }
+        }
+        return NULL;
+    }
+
+    /* For each offered type, find the best matching media range:
+     * exact (3) > subtype wildcard (2) > full wildcard (1); only
+     * ranges with q > 0 count (q=0 excludes). */
+    const char *best_type = NULL;
+    int best_score = 0;
+    double best_q = 0.0;
+
+    for (size_t t = 0; types[t] != NULL; t++) {
+        const char *slash = strchr(types[t], '/');
+        if (slash == NULL) {
+            continue; /* malformed offer */
+        }
+        size_t type_len = (size_t)(slash - types[t]);
+        const char *subtype = slash + 1;
+        size_t sub_len = strlen(subtype);
+
+        int score = 0;
+        double q = 0.0;
+
+        for (size_t h = 0; h < req->headers.count; h++) {
+            if (strcasecmp(req->headers.items[h].key, HTTP_HEADER_ACCEPT) !=
+                0) {
+                continue;
+            }
+            const char *p = req->headers.items[h].value;
+            while (*p != '\0') {
+                while (*p == ' ' || *p == '\t' || *p == ',') {
+                    p++;
+                }
+                if (*p == '\0') {
+                    break;
+                }
+
+                /* media range: full wildcard, subtype wildcard or
+                 * an exact type/subtype pair */
+                const char *tstart = p;
+                while (*p != '\0' && *p != ',' && *p != '/' && *p != ';') {
+                    p++;
+                }
+                size_t rtype_len = (size_t)(p - tstart);
+
+                int rscore = 0;
+                if (*p == '/') {
+                    p++;
+                    const char *sstart = p;
+                    while (*p != '\0' && *p != ',' && *p != ';') {
+                        p++;
+                    }
+                    size_t rsub_len = (size_t)(p - sstart);
+
+                    int type_match =
+                        (rtype_len == 1 && tstart[0] == '*') ||
+                        (rtype_len == type_len &&
+                         strncasecmp(tstart, types[t], type_len) == 0);
+                    int sub_match =
+                        (rsub_len == 1 && sstart[0] == '*') ||
+                        (rsub_len == sub_len &&
+                         strncasecmp(sstart, subtype, sub_len) == 0);
+                    if (type_match && sub_match) {
+                        if (rtype_len == type_len) {
+                            /* exact type: exact subtype beats wildcard */
+                            rscore = (rsub_len == sub_len) ? 3 : 2;
+                        } else {
+                            rscore = 1; /* wildcard type */
+                        }
+                    }
+                } else if (rtype_len == 1 && tstart[0] == '*') {
+                    rscore = 1; /* a bare asterisk means any type */
+                }
+
+                double q_val = accepts_parse_q(&p);
+
+                if (rscore > 0 && q_val > 0.0 &&
+                    (rscore > score || (rscore == score && q_val > q))) {
+                    score = rscore;
+                    q = q_val;
+                }
+
+                while (*p != '\0' && *p != ',') {
+                    p++;
+                }
+                if (*p == ',') {
+                    p++;
+                }
+            }
+        }
+
+        /* pick the overall winner: score, then q, then offer order */
+        if (score > 0 && (best_type == NULL || score > best_score ||
+                          (score == best_score && q > best_q))) {
+            best_type = types[t];
+            best_score = score;
+            best_q = q;
+        }
+    }
+
+    return best_type;
+}
+
+void http_set_error_handler(HttpServer *server, HttpErrorHandler handler)
+{
+    HTTP_ASSERT(server != NULL);
+    HTTP_ASSERT_MSG(server->listening == false,
+                    "cannot set an error handler while listening");
+
+    if (server == NULL) {
+        return;
+    }
+    server->error_handler = handler;
 }
 
 const char *http_req_param(const HttpRequest *req, const char *key)

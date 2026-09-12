@@ -20,6 +20,7 @@
 
 #include "c_http_static.h"
 
+#include <errno.h>
 #include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -352,7 +353,10 @@ void http_static_handler(const HttpRequest *req, HttpResponse *res,
         return;
     }
 
-    /* 7. conditional GET: weak ETag from (mtime, size) */
+    /* 7. This file supports single-range requests (RFC 9110 §14). */
+    http_set_header(&res->headers, HTTP_HEADER_ACCEPT_RANGES, "bytes");
+
+    /* 8. conditional GET: weak ETag from (mtime, size) */
     char etag[64];
     snprintf(etag, sizeof(etag), "W/\"%llx-%llx\"",
              (unsigned long long)st.st_mtime, (unsigned long long)st.st_size);
@@ -362,7 +366,100 @@ void http_static_handler(const HttpRequest *req, HttpResponse *res,
         return;
     }
 
-    /* 8. response headers */
+    /* 9. single-range requests (RFC 9110 §14.2): "bytes=first-last",
+     * "bytes=-N" (suffix) and "bytes=N-" (open end). Unsupported or
+     * malformed Range headers are IGNORED (a full 200 — RFC 9110
+     * §14.2: a server MUST ignore a Range header with a range unit it
+     * does not understand). Multi-range requests fall back to a full
+     * 200 as well. Unsatisfiable ranges get 416 + Content-Range. */
+    const char *range = http_req_header(req, HTTP_HEADER_RANGE);
+    if (range != NULL && strncasecmp(range, "bytes=", 6) == 0) {
+        const char *spec = range + 6;
+        unsigned long long size = (unsigned long long)st.st_size;
+        bool ok = false;         /* parsed a valid single range */
+        bool satisfiable = true; /* false -> 416 */
+        unsigned long long start = 0;
+        unsigned long long len = 0;
+
+        if (strchr(spec, ',') == NULL) { /* single range only */
+            char *end = NULL;
+            errno = 0;
+            if (spec[0] == '-') {
+                /* suffix: the last suffix_len bytes */
+                long long suffix_len = strtoll(spec + 1, &end, 10);
+                if (end != spec + 1 && *end == '\0' && errno == 0) {
+                    if (suffix_len <= 0 || size == 0) {
+                        /* "bytes=-0" and any suffix on an EMPTY file
+                         * are unsatisfiable (the range is empty) */
+                        satisfiable = false;
+                    } else {
+                        ok = true;
+                        if ((unsigned long long)suffix_len >= size) {
+                            start = 0; /* more than the file: everything */
+                            len = size;
+                        } else {
+                            start = size - (unsigned long long)suffix_len;
+                            len = (unsigned long long)suffix_len;
+                        }
+                    }
+                }
+            } else {
+                long long first = strtoll(spec, &end, 10);
+                if (end != spec && errno == 0 && first >= 0 && *end == '-') {
+                    long long last = -1;
+                    if (end[1] == '\0') {
+                        /* open end: from first to EOF */
+                        if ((unsigned long long)first >= size) {
+                            satisfiable = false;
+                        } else {
+                            ok = true;
+                            start = (unsigned long long)first;
+                            len = size - start;
+                        }
+                    } else {
+                        last = strtoll(end + 1, &end, 10);
+                        if (*end == '\0' && errno == 0 && last >= first) {
+                            if ((unsigned long long)first >= size) {
+                                satisfiable = false;
+                            } else {
+                                ok = true;
+                                start = (unsigned long long)first;
+                                unsigned long long end_pos =
+                                    (unsigned long long)last >= size
+                                        ? size - 1
+                                        : (unsigned long long)last;
+                                len = end_pos - start + 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (ok) {
+            char content_range[96];
+            snprintf(content_range, sizeof(content_range),
+                     "bytes %llu-%llu/%llu", start, start + len - 1, size);
+            http_set_header(&res->headers, HTTP_HEADER_CONTENT_RANGE,
+                            content_range);
+            res->status = HTTP_STATUS_PARTIAL_CONTENT; /* 206 */
+            res->ranged = true;
+            res->range_start = (size_t)start;
+            res->range_len = (size_t)len;
+        } else if (!satisfiable) {
+            /* RFC 9110 §15.5.17: 416 must state the complete length */
+            char content_range[64];
+            snprintf(content_range, sizeof(content_range), "bytes */%llu",
+                     size);
+            http_set_header(&res->headers, HTTP_HEADER_CONTENT_RANGE,
+                            content_range);
+            res->status = HTTP_STATUS_RANGE_NOT_SATISFIABLE;
+            return;
+        }
+        /* else: malformed/multi-range — ignored, the full 200 below */
+    }
+
+    /* 10. response headers */
     http_set_header(&res->headers, HTTP_HEADER_CONTENT_TYPE, mime_for(fs_path));
     http_set_header(&res->headers, HTTP_HEADER_ETAG, etag);
     char last_modified[64];
@@ -376,7 +473,7 @@ void http_static_handler(const HttpRequest *req, HttpResponse *res,
                         cache_control);
     }
 
-    /* 9. stream the file as the body — the library sends it instead of
+    /* 11. stream the file as the body — the library sends it instead of
      * res->body and frees the path afterwards. The strdup prevents a
      * dangling pointer to our stack buffer. */
     free(res->file_path);
@@ -385,7 +482,9 @@ void http_static_handler(const HttpRequest *req, HttpResponse *res,
         res->status = HTTP_STATUS_INTERNAL_SERVER_ERROR;
         return;
     }
-    res->status = HTTP_STATUS_OK;
+    if (!res->ranged) {
+        res->status = HTTP_STATUS_OK; /* ranged: 206 is already set */
+    }
 }
 
 /* ============================================================

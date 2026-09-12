@@ -17,7 +17,7 @@ The output file can be consumed in two ways:
 
 2. Or just include it and link the compiled .c files normally.
 
-Requires: zlib (for gzip encoding support)
+Requires: zlib (for gzip encoding support), pthreads
 """
 
 import os
@@ -32,18 +32,20 @@ HEADER_FILES = [
     os.path.join(ROOT_DIR, "include", "c_http.h"),
     os.path.join(ROOT_DIR, "include", "c_http_assert.h"),
     os.path.join(ROOT_DIR, "include", "c_http_static.h"),
+    os.path.join(ROOT_DIR, "include", "c_http_ws.h"),
 ]
 
 SOURCE_FILES = [
     os.path.join(ROOT_DIR, "src", "c_http.c"),
     os.path.join(ROOT_DIR, "src", "c_http_encoder.c"),
     os.path.join(ROOT_DIR, "src", "c_http_static.c"),
+    os.path.join(ROOT_DIR, "src", "c_http_ws.c"),
 ]
 
 OUTPUT_DEFAULT = os.path.join(ROOT_DIR, "c_http_single.h")
 
 # Our own includes to strip during amalgamation
-OUR_HEADERS = {"c_http.h", "c_http_assert.h", "c_http_static.h"}
+OUR_HEADERS = {"c_http.h", "c_http_assert.h", "c_http_static.h", "c_http_ws.h"}
 
 
 def strip_include_guard(content):
@@ -155,7 +157,7 @@ def main():
  *   // In all other files:
  *   #include "c_http_single.h"
  *
- * Requires: zlib (link with -lz)
+ * Requires: zlib (link with -lz) and pthreads (-lpthread)
  * Source:   https://github.com/maxischmaxi/c-http
  * ========================================================================== */
 

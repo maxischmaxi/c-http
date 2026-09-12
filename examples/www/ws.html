@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>c-http WebSocket demo</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
+  #log { border: 1px solid #ccc; height: 300px; overflow-y: auto; padding: .5rem; margin: 1rem 0; }
+  .me { color: #080; }
+  .sys { color: #888; font-style: italic; }
+  input { width: 70%; }
+</style>
+</head>
+<body>
+<h1>WebSocket chat demo</h1>
+<p>
+  Connects to <code>/ws/chat/lobby</code> and broadcasts every message
+  to all connected clients (try two browser tabs).
+  The echo endpoint <code>/ws/echo</code> is also available.
+</p>
+<div id="log"></div>
+<input id="msg" placeholder="type a message..." autocomplete="off">
+<button id="send">send</button>
+
+<script>
+const log = (text, cls) => {
+  const line = document.createElement("div");
+  if (cls) line.className = cls;
+  line.textContent = text;
+  document.getElementById("log").appendChild(line);
+  log_scroller.scrollTop = log_scroller.scrollHeight;
+};
+const log_scroller = document.getElementById("log");
+
+let ws = new WebSocket(
+  (location.protocol === "https:" ? "wss://" : "ws://") +
+  location.host + "/ws/chat/lobby"
+);
+ws.onopen = () => log("connected", "sys");
+ws.onclose = (e) => log("disconnected (code " + e.code + ")", "sys");
+ws.onerror = () => log("error", "sys");
+ws.onmessage = (e) => log(e.data);
+
+document.getElementById("send").onclick = send;
+document.getElementById("msg").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") send();
+});
+function send() {
+  const input = document.getElementById("msg");
+  if (input.value === "") return;
+  ws.send(input.value);
+  log("me: " + input.value, "me");
+  input.value = "";
+}
+</script>
+</body>
+</html>
