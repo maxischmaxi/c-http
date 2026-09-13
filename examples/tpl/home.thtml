@@ -18,7 +18,7 @@ component nav_bar(void) {
   <nav>
     <a href="/">Home</a> |
     <a href="/api/status">API status</a> |
-    <a href="/ws.html">Chat demo</a>
+    <a href="/public/ws.html">Chat demo</a>
   </nav>
 }
 

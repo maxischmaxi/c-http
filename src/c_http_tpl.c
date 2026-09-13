@@ -727,7 +727,11 @@ bool tpl_once_begin(TplOut *out, TplOnce *handle)
     if (fired == NULL) {
         return false; /* treat an OOM as "already rendered" */
     }
-    memcpy(fired, out->once_fired, out->once_fired_count * sizeof(*fired));
+    /* memcpy(NULL, 0) is UB — the registry starts empty. */
+    if (out->once_fired_count > 0) {
+        memcpy(fired, out->once_fired,
+               out->once_fired_count * sizeof(*fired));
+    }
     fired[out->once_fired_count] = handle;
     out->once_fired = fired;
     out->once_fired_count++;

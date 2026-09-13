@@ -59,7 +59,7 @@ void tpl_feature_note(TplOut *out)
 void tpl_nav_bar(TplOut *out)
 {
 #line 17 "/stuff/programming/c-http/examples/tpl/home.thtml"
-    tpl_lit(out, "\n  <nav>\n    <a href=\"/\">Home</a> |\n    <a href=\"/api/status\">API status</a> |\n    <a href=\"/ws.html\">Chat demo</a>\n  </nav>");
+    tpl_lit(out, "\n  <nav>\n    <a href=\"/\">Home</a> |\n    <a href=\"/api/status\">API status</a> |\n    <a href=\"/public/ws.html\">Chat demo</a>\n  </nav>");
 }
 
 void tpl_link_list(TplOut *out, const HomePageData *p)

@@ -44,7 +44,7 @@ static void fill_home_data(HomePageData *data)
             {
                 {"API status", "/api/status"},
                 {"Admin dashboard", "/admin/dashboard"},
-                {"WebSocket chat", "/ws.html"},
+                {"WebSocket chat", "/public/ws.html"},
             },
     };
 }
