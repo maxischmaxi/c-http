@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define C_HTTP_VERSION "0.7.0"
+#define C_HTTP_VERSION "0.9.0"
 
 /* Parsing limits: buffer sizes must match these values. */
 #define HTTP_METHOD_MAX  8 /* longest known method: "CONNECT" */
@@ -438,6 +438,12 @@ typedef struct {
     char body[4096];
     size_t body_len;
     HttpHeaders headers;
+    /* Heap body: set by http_res_body()/http_res_html() when the body
+     * does not fit the fixed 4096-byte buffer above. Owned by the
+     * response; the library frees it after the send. NULL = the
+     * regular body buffer carries the body. */
+    char *dyn_body;
+    size_t dyn_body_len;
     /* Locals: request-scoped data passed down the chain (middleware
      * writes via http_set_local(), handler reads via http_res_local()).
      * Fixed slots — no cleanup needed, per-request lifetime. */
@@ -673,6 +679,15 @@ const char *http_res_local(const HttpResponse *res, const char *key);
  * serialized JSON). -1 on invalid status or body too long for the
  * 4096-byte response buffer. */
 int http_res_json(HttpResponse *res, int status, const char *body);
+
+/* Status + explicit Content-Type + body of any length: bodies that
+ * fit the fixed 4096-byte response buffer are copied into it,
+ * larger ones into a heap body (dyn_body) that the library frees
+ * after the send. http_res_html() builds on this. -1 on invalid
+ * status, NULL body with a nonzero length, or a Content-Type with
+ * CR/LF (header injection) — on -1 nothing is written. */
+int http_res_body(HttpResponse *res, int status, const char *content_type,
+                  const char *body, size_t body_len);
 
 /* 3xx status + Location header, empty body. -1 outside 300-399 or on
  * CR/LF injection in the location. */

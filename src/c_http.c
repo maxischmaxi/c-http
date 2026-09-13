@@ -36,11 +36,18 @@
 #define MSG_NOSIGNAL 0 /* platform without MSG_NOSIGNAL (e.g. macOS) */
 #endif
 
-static void free_encoded_body(HttpResponse *res)
+/* Frees the transient heap bodies (encoded_body, dyn_body) after
+ * the response was sent — the regular body buffer is fixed and
+ * needs no cleanup. */
+static void free_transient_body(HttpResponse *res)
 {
     if (res->encoded_body != NULL) {
         free(res->encoded_body);
         res->encoded_body = NULL;
+    }
+    if (res->dyn_body != NULL) {
+        free(res->dyn_body);
+        res->dyn_body = NULL;
     }
 }
 
@@ -819,10 +826,21 @@ static void send_res(HttpResponse *res, int client_fd, bool suppress_body)
         }
     }
 
-    size_t body_len =
-        res->encoded_body != NULL ? res->encoded_body_len : res->body_len;
-    const char *body =
-        res->encoded_body != NULL ? res->encoded_body : res->body;
+    /* Body selection: the encoded heap body wins (gzip), then the
+     * template/oversized heap body (dyn_body), then the fixed
+     * 4096-byte buffer. */
+    size_t body_len;
+    const char *body;
+    if (res->encoded_body != NULL) {
+        body_len = res->encoded_body_len;
+        body = res->encoded_body;
+    } else if (res->dyn_body != NULL) {
+        body_len = res->dyn_body_len;
+        body = res->dyn_body;
+    } else {
+        body_len = res->body_len;
+        body = res->body;
+    }
 
     HTTP_ASSERT_MSG(res->body_len <= sizeof(res->body),
                     "body_len exceeds body buffer — buffer overflow");
@@ -917,7 +935,7 @@ static void send_res(HttpResponse *res, int client_fd, bool suppress_body)
 
 out:
     xclose_fd(file_fd);
-    free_encoded_body(res);
+    free_transient_body(res);
     free(res->file_path);
     res->file_path = NULL;
 }
@@ -2728,6 +2746,46 @@ int http_res_json(HttpResponse *res, int status, const char *body)
     return 0;
 }
 
+int http_res_body(HttpResponse *res, int status, const char *content_type,
+                  const char *body, size_t body_len)
+{
+    if (res == NULL || (body == NULL && body_len > 0) ||
+        !is_valid_status_code(status) || content_type == NULL ||
+        content_type[0] == '\0') {
+        return -1;
+    }
+    if (http_set_header(&res->headers, HTTP_HEADER_CONTENT_TYPE,
+                        content_type) != HTTP_SET_HEADER_OK) {
+        return -1; /* http_set_header rejects CR/LF injection */
+    }
+
+    if (body_len < sizeof(res->body)) {
+        /* Fits the fixed buffer: copy in and drop any previous heap
+         * body (overwrite semantics, no leak on repeated calls). */
+        if (body_len > 0) {
+            memcpy(res->body, body, body_len);
+        }
+        res->body[body_len] = '\0';
+        res->body_len = body_len;
+        free(res->dyn_body);
+        res->dyn_body = NULL;
+        res->dyn_body_len = 0;
+    } else {
+        /* Too large: take a heap copy that the send path frees. */
+        char *copy = malloc(body_len);
+        if (copy == NULL) {
+            return -1;
+        }
+        memcpy(copy, body, body_len);
+        free(res->dyn_body); /* overwrite, not append */
+        res->dyn_body = copy;
+        res->dyn_body_len = body_len;
+        res->body_len = 0;
+    }
+    res->status = status;
+    return 0;
+}
+
 int http_res_redirect(HttpResponse *res, int status, const char *location)
 {
     if (res == NULL || location == NULL) {
@@ -2808,6 +2866,14 @@ void http_error(HttpResponse *res, int status, const char *message)
     }
     res->status = status;
     res->error = true;
+    /* An error handler formats the body at send time into the FIXED
+     * buffer — a template heap body (dyn_body) from the handler must
+     * not shadow it, so it is dropped here. */
+    if (res->dyn_body != NULL) {
+        free(res->dyn_body);
+        res->dyn_body = NULL;
+        res->dyn_body_len = 0;
+    }
     snprintf(res->error_message, sizeof(res->error_message), "%s",
              message != NULL ? message : status_text(status));
 }

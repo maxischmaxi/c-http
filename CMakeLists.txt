@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 project(c-http
-  VERSION 0.7.0
+  VERSION 0.9.0
   LANGUAGES C
   DESCRIPTION "A minimal HTTP server library in C"
 )
@@ -62,6 +62,7 @@ add_library(c_http STATIC
   src/c_http.c
   src/c_http_encoder.c
   src/c_http_static.c
+  src/c_http_tpl.c
   src/c_http_ws.c
 )
 target_include_directories(c_http PUBLIC
@@ -98,10 +99,12 @@ if(C_HTTP_AMALGAMATE)
       ${CMAKE_CURRENT_SOURCE_DIR}/include/c_http.h
       ${CMAKE_CURRENT_SOURCE_DIR}/include/c_http_assert.h
       ${CMAKE_CURRENT_SOURCE_DIR}/include/c_http_static.h
+      ${CMAKE_CURRENT_SOURCE_DIR}/include/c_http_tpl.h
       ${CMAKE_CURRENT_SOURCE_DIR}/include/c_http_ws.h
       ${CMAKE_CURRENT_SOURCE_DIR}/src/c_http.c
       ${CMAKE_CURRENT_SOURCE_DIR}/src/c_http_encoder.c
       ${CMAKE_CURRENT_SOURCE_DIR}/src/c_http_static.c
+      ${CMAKE_CURRENT_SOURCE_DIR}/src/c_http_tpl.c
       ${CMAKE_CURRENT_SOURCE_DIR}/src/c_http_ws.c
       ${CMAKE_CURRENT_SOURCE_DIR}/scripts/amalgamate.py
     COMMENT "Generating single-header amalgamation"
@@ -109,14 +112,40 @@ if(C_HTTP_AMALGAMATE)
 endif()
 
 # ---------------------------------------------------------------------------
+# ctmpl: .thtml -> C generator (build tool, not installed)
+# ---------------------------------------------------------------------------
+if(C_HTTP_IS_TOPLEVEL)
+  add_executable(ctmpl tools/ctmpl.c tools/ctmpl_main.c)
+  c_http_apply_options(ctmpl)
+endif()
+
+# ---------------------------------------------------------------------------
 # examples (only when top-level)
 # ---------------------------------------------------------------------------
 if(C_HTTP_IS_TOPLEVEL AND C_HTTP_BUILD_EXAMPLES)
   add_subdirectory(vendor/cargs EXCLUDE_FROM_ALL)
-  add_executable(c-http-example examples/main.c examples/args.c)
+
+  # Regeneration of the example template: ctmpl compiles home.thtml
+  # into home_templ.[ch] (committed, like templ's _templ.go files).
+  # Rebuilds when the .thtml or the generator changes.
+  add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/examples/tpl/home_templ.h
+           ${CMAKE_CURRENT_SOURCE_DIR}/examples/tpl/home_templ.c
+    COMMAND $<TARGET_FILE:ctmpl>
+            ${CMAKE_CURRENT_SOURCE_DIR}/examples/tpl/home.thtml
+    DEPENDS ctmpl ${CMAKE_CURRENT_SOURCE_DIR}/examples/tpl/home.thtml
+    COMMENT "ctmpl: regenerating examples/tpl/home_templ.[ch]"
+  )
+  add_custom_target(ctmpl_generate
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/examples/tpl/home_templ.h
+            ${CMAKE_CURRENT_SOURCE_DIR}/examples/tpl/home_templ.c)
+
+  add_executable(c-http-example examples/main.c examples/args.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/examples/tpl/home_templ.c)
   target_link_libraries(c-http-example PRIVATE c_http cargs)
   c_http_apply_options(c-http-example)
   target_include_directories(c-http-example SYSTEM PRIVATE vendor/cargs/include)
+  target_include_directories(c-http-example PRIVATE examples)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -139,6 +168,16 @@ if(C_HTTP_IS_TOPLEVEL AND C_HTTP_BUILD_TESTS)
   target_link_libraries(test_ws PRIVATE c_http Threads::Threads)
   c_http_apply_options(test_ws)
   add_test(NAME ws COMMAND test_ws)
+
+  add_executable(test_tpl tests/test_template.c)
+  target_link_libraries(test_tpl PRIVATE c_http Threads::Threads)
+  c_http_apply_options(test_tpl)
+  add_test(NAME tpl COMMAND test_tpl)
+
+  add_executable(test_ctmpl tests/test_ctmpl.c tools/ctmpl.c)
+  c_http_apply_options(test_ctmpl)
+  target_include_directories(test_ctmpl PRIVATE tools)
+  add_test(NAME ctmpl COMMAND test_ctmpl)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -171,7 +210,10 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/c-httpConfig.cmake
 # development helpers
 # ---------------------------------------------------------------------------
 file(GLOB C_HTTP_SOURCES CONFIGURE_DEPENDS
-  include/*.h src/*.c examples/*.c examples/*.h tests/*.c tests/*.h)
+  include/*.h src/*.c tools/*.c tools/*.h
+  examples/*.c examples/*.h examples/tpl/*.h
+  tests/*.c tests/*.h)
+list(FILTER C_HTTP_SOURCES EXCLUDE REGEX "_templ\\.[ch]$")
 add_custom_target(format
   COMMAND clang-format -i ${C_HTTP_SOURCES})
 add_custom_target(format-check

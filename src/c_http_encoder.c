@@ -251,7 +251,13 @@ bool http_encode_body(HttpServer *server, const HttpRequest *req,
     HTTP_ASSERT(server->encoders.encoders != NULL ||
                 server->encoders.count == 0);
 
-    if (res->body_len == 0 || res->encoded_body != NULL) {
+    /* The heap body (dyn_body, template/large responses) is encoded
+     * like a fixed-buffer body — encoded_body takes priority at send
+     * time, so the selection stays two-level everywhere. */
+    const char *src = res->dyn_body != NULL ? res->dyn_body : res->body;
+    size_t src_len = res->dyn_body != NULL ? res->dyn_body_len : res->body_len;
+
+    if (src_len == 0 || res->encoded_body != NULL) {
         return false;
     }
 
@@ -271,13 +277,13 @@ bool http_encode_body(HttpServer *server, const HttpRequest *req,
 
         char *encoded = NULL;
         size_t encoded_len = 0;
-        if (server->encoders.encoders[i].encode(res->body, res->body_len,
-                                                &encoded, &encoded_len) != 0) {
+        if (server->encoders.encoders[i].encode(src, src_len, &encoded,
+                                                &encoded_len) != 0) {
             continue;
         }
 
         /* Skip if the encoding made the body larger */
-        if (encoded_len >= res->body_len) {
+        if (encoded_len >= src_len) {
             free(encoded);
             continue;
         }

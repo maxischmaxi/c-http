@@ -1,0 +1,66 @@
+// example page template — compiled by ctmpl into home_templ.[ch]
+// (regenerate with: cmake --build build -t ctmpl_generate)
+
+#include "home_data.h"
+
+once note_style
+
+component feature_note(void) {
+  <!-- @once: the <style> reaches the page exactly once per render,
+       no matter how often this component is used on it -->
+  @once(note_style) {
+    <style>.note { color: #666; font-size: 0.9em; }</style>
+  }
+  <p class="note">rendered server-side with ctmpl</p>
+}
+
+component nav_bar(void) {
+  <nav>
+    <a href="/">Home</a> |
+    <a href="/api/status">API status</a> |
+    <a href="/ws.html">Chat demo</a>
+  </nav>
+}
+
+component link_list(const HomePageData *p) {
+  <ul class="links">
+  for size_t i = 0; i < p->link_count; i++ {
+    <li><a href={ tpl_url(out, p->links[i].url) }>{ p->links[i].name }</a></li>
+  }
+  </ul>
+}
+
+component layout(TplChildren *children) {
+  <!DOCTYPE html>
+  <html lang="en">
+    <head>
+      <meta charset="utf-8"/>
+      <title>c-http example</title>
+    </head>
+    <body>
+      @nav_bar()
+      <main>
+        { children... }
+      </main>
+    </body>
+  </html>
+}
+
+component home(const HomePageData *p) {
+  @layout() {
+    @feature_note()
+    <h1>{ p->title }</h1>
+    if p->logged_in {
+      <p>Welcome back, <b>{ p->user }</b>!</p>
+    } else {
+      <p><a href="/login">Log in</a> to see more.</p>
+    }
+    <hr noshade?={ p->logged_in }/>
+    <p>Server features:</p>
+    <!-- @fragment: /frag renders ONLY this block — htmx swaps it in -->
+    @fragment("links") {
+      @link_list(p)
+    }
+    @feature_note()
+  }
+}

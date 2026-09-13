@@ -93,6 +93,8 @@ target_link_libraries(my-app PRIVATE c_http::c_http)
 | Keep-alive (opt-in, RFC 9112)            | ✅     |
 | Auto-OPTIONS (204 + Allow)               | ✅     |
 | Static file serving (`http_static_mount`) | ✅     |
+| Templating (`ctmpl`, templ-style `.thtml`) | ✅ |
+| Heap response bodies (`http_res_body`, > 4096 bytes) | ✅ |
 | File streaming (`res->file_path`)         | ✅     |
 | Graceful shutdown (`http_stop_server`)    | ✅     |
 | WebSockets (`http_ws`, RFC 6455, server)  | ✅     |
@@ -156,6 +158,120 @@ Rules and guarantees:
 - `HttpWsOptions`: pre-handshake `verify` callback (origin checks), supported
   `subprotocols` (first client offer wins), `max_message`.
 
+## Templating (ctmpl)
+
+A [templ](https://templ.guide)-inspired template system: `.thtml` files
+contain components — HTML markup mixed with C expressions — and are
+**compiled into plain C functions** by the `ctmpl` generator
+(`tools/ctmpl.c`). Like templ, the generator does not understand C:
+expressions, conditions and for-heads are copied verbatim and
+type-checked by the C compiler, and `#line` directives make compiler
+errors point into the `.thtml` file.
+
+```text
+// home.thtml
+component greeting(const char *name) {
+  <div class="greeting">Hello, { name }!</div>
+}
+
+component page(const HomePageData *p) {
+  @greeting(p->user)
+  if p->logged_in {
+    <hr noshade?={ p->admin }/>
+  }
+  for size_t i = 0; i < p->link_count; i++ {
+    <li><a href={ tpl_url(out, p->links[i].url) }>{ p->links[i].name }</a></li>
+  }
+}
+```
+
+Regenerate `home_templ.h`/`home_templ.c` (committed, like templ's
+`*_templ.go` files):
+
+```bash
+./build/ctmpl examples/tpl/home.thtml   # or: cmake --build build -t ctmpl_generate
+```
+
+Render in a handler — the view model is a plain struct, the output
+is written through a growable `TplOut` and sent as `text/html`
+(bodies larger than the 4096-byte buffer go through a heap body):
+
+```c
+#include "tpl/home_templ.h"
+
+static void home_handler(const HttpRequest *req, HttpResponse *res)
+{
+    HomePageData data = {.title = "Welcome", .logged_in = true, /* ... */};
+    TplOut out = {0};
+    tpl_page(&out, &data);
+    if (http_res_html(res, HTTP_STATUS_OK, &out) != 0) {
+        http_error(res, HTTP_STATUS_INTERNAL_SERVER_ERROR, "render failed");
+    }
+    tpl_out_free(&out);
+}
+```
+
+### Syntax
+
+| Syntax | Meaning |
+| --- | --- |
+| `component name(<C params>) { ... }` | component -> `void tpl_name(TplOut *out, <params>)` |
+| `{ expr }` | HTML-escaped interpolation |
+| `href={ expr }` | attribute expression — URL attrs require `TplUrl` (`tpl_url`/`tpl_safe_url`), `style=` requires `TplCss` |
+| `@component(args)` | render another component |
+| `@component(args) { ... }` | pass child content (`{ children... }` renders it) |
+| `@component(args) with (expr) { ... }` | bind child data (`tpl_data`) |
+| `@fragment(name) { ... }` | fragment — render selectively via `tpl_frag_select` (htmx) |
+| `once <name>` + `@once(handle) { ... }` | render once per render (per `TplOut`) |
+| `attr?={ cond }` | boolean attribute |
+| `if <C cond> { } else { }`, `for <C head> { }` | C control flow in markup |
+| `@raw(expr)` | trusted HTML, not escaped (templ's `templ.Raw`) |
+| `#include "..."` | copied verbatim into the generated header |
+
+Rules and guarantees:
+
+- **Escaping:** `{ expr }` output is HTML-escaped in text context and
+  attribute-escaped in attribute context (`& < > " '` → entities);
+  `@raw` is the only escape hatch.
+- **URL safety (typed):** href/src/action/… expressions are emitted
+  with a writer that accepts ONLY `TplUrl` — `tpl_url()` sanitizes
+  (`javascript:` → `about:invalid#ctmpl`), `tpl_safe_url()` is the
+  deliberate bypass. Unwrapped values are a C compile error pointing
+  into the `.thtml`.
+- **CSS safety (typed):** `style={ expr }` requires `TplCss` —
+  `tpl_css()` sanitizes declarations (dangerous values become
+  `zctmplUnsafeCSS`), `tpl_css_safe()` bypasses.
+- **on-attributes:** expressions in `on*`/`hx-on:*` attributes are
+  compile-time errors — use a `data-*` attribute plus a `<script>`
+  block (CSP-friendly, like templ's rule).
+- **Children:** C has no closures. A child block captures the
+  enclosing component's single parameter automatically; for anything
+  else use `with (expr)` and `tpl_data`/`out->ctx`.
+- **Statements:** like templ, a text run *starting* with `if`/`for`/
+  `else` is a statement — literal text needs `{ "for ..." }`.
+- `<script>`/`<style>` contents pass through raw (no interpolation —
+  build strings in C and use `@raw`).
+- Value helpers: `tpl_int`, `tpl_fmt` (printf-style), `tpl_url` —
+  C cannot print arbitrary types, so numbers are explicit.
+- **Structure validation:** ctmpl tracks a tag stack per component
+  and rejects mismatched/unclosed tags and non-void self-closing
+  tags (`<div/>` — browsers ignore the slash). Void elements
+  (`img`, `br`, `input`, …) need no closing tag; closing them is an
+  error. Comments and the doctype don't affect the stack.
+- **Fragments:** the body always executes; with `tpl_frag_select`
+  set, only matching `@fragment` output is kept (nested render with
+  the parent, unknown names → empty 200) — the canonical htmx flow
+  (see the `/frag` route of the example server).
+- **Render once:** `once <name>` declares a handle, `@once(handle)`
+  renders its block the first time per request — reusable
+  components can ship their `<style>`/`<script>` dependency without
+  duplicating it on the page.
+
+The full syntax reference lives in [`tools/ctmpl.h`](tools/ctmpl.h);
+the runtime in [`include/c_http_tpl.h`](include/c_http_tpl.h); an
+end-to-end example in [`examples/tpl/`](examples/tpl/) and
+`examples/main.c` (the `/` route of the example server).
+
 ## Build types
 
 ```bash
@@ -171,17 +287,20 @@ cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
 Defined in [`include/c_http.h`](include/c_http.h):
 
 ```c
-#define C_HTTP_VERSION "0.7.0"
+#define C_HTTP_VERSION "0.9.0"
 ```
 
 ## Project structure
 
 ```
-include/         Public headers (c_http.h, c_http_assert.h)
+include/         Public headers (c_http.h, c_http_assert.h,
+                 c_http_static.h, c_http_tpl.h, c_http_ws.h)
 src/             Library implementation (c_http.c, c_http_encoder.c,
-                 c_http_static.c, c_http_ws.c)
+                 c_http_static.c, c_http_tpl.c, c_http_ws.c)
+tools/           ctmpl: .thtml -> C generator
 examples/        Example server using the library
-                 (incl. a websocket chat demo: examples/www/ws.html)
+                 (incl. a websocket chat demo: examples/www/ws.html,
+                 a ctmpl page: examples/tpl/)
 tests/           Integration tests (raw-socket style)
 scripts/         Amalgamation script
 ```
@@ -196,6 +315,7 @@ cmake --build build -t format       # clang-format
 cmake --build build -t format-check # CI format check
 cmake --build build -t lint         # clang-tidy
 cmake --build build -t c_http_amalgamate  # generate single-header
+cmake --build build -t ctmpl_generate     # regenerate example templates
 ctest --test-dir build --output-on-failure  # run tests
 ```
 

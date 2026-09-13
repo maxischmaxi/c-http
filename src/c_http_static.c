@@ -51,7 +51,7 @@ typedef struct HttpStaticMount {
  * Helpers
  * ============================================================ */
 
-static int hex_val(char c)
+static int static_hex_val(char c)
 {
     if (c >= '0' && c <= '9') {
         return c - '0';
@@ -81,8 +81,8 @@ static int url_decode(const char *in, char *out, size_t out_size)
             return -1; /* truncation, not overflow */
         }
         if (in[i] == '%') {
-            int hi = hex_val(in[i + 1]);
-            int lo = hex_val(in[i + 2]);
+            int hi = static_hex_val(in[i + 1]);
+            int lo = static_hex_val(in[i + 2]);
             if (hi < 0 || lo < 0) {
                 return -1;
             }

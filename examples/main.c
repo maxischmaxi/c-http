@@ -13,6 +13,8 @@
 #include "c_http.h"
 #include "c_http_assert.h"
 #include "c_http_static.h"
+#include "c_http_tpl.h"
+#include "tpl/home_templ.h"
 
 static HttpServer *g_server = NULL;
 
@@ -29,18 +31,57 @@ static void on_terminate(int sig)
  * Handlers
  * ------------------------------------------------------------------------- */
 
+/* View model for the home page — shared by the full render and the
+ * /frag fragment route. */
+static void fill_home_data(HomePageData *data)
+{
+    *data = (HomePageData){
+        .title = "Welcome to c-http",
+        .user = "max",
+        .logged_in = true,
+        .link_count = 3,
+        .links =
+            {
+                {"API status", "/api/status"},
+                {"Admin dashboard", "/admin/dashboard"},
+                {"WebSocket chat", "/ws.html"},
+            },
+    };
+}
+
+/* Home page rendered from examples/tpl/home.thtml via ctmpl: the
+ * handler fills a view model, the generated components render it. */
 static void home_handler(const HttpRequest *req, HttpResponse *res)
 {
-    printf("home handler\n");
+    printf("home handler (template)\n");
     (void)req;
-    res->status = 200;
-    const char *b = "<h1>Welcome to c-http</h1>"
-                    "<p>Try: <a href=\"/api/status\">/api/status</a>, "
-                    "<a href=\"/api/users\">/api/users</a>, "
-                    "<a href=\"/admin/dashboard\">/admin/dashboard</a></p>";
-    size_t len = strlen(b);
-    memcpy(res->body, b, len);
-    res->body_len = len;
+    HomePageData data;
+    fill_home_data(&data);
+    TplOut out = {0};
+    tpl_home(&out, &data);
+    if (http_res_html(res, HTTP_STATUS_OK, &out) != 0) {
+        http_error(res, HTTP_STATUS_INTERNAL_SERVER_ERROR,
+                   "template render failed");
+    }
+    tpl_out_free(&out);
+}
+
+/* Fragment route (the htmx flow): ?name=<fragment> renders ONLY the
+ * matching @fragment block — the rest of the page executes but its
+ * output is discarded. Unknown names produce an empty 200. */
+static void frag_handler(const HttpRequest *req, HttpResponse *res)
+{
+    const char *name = http_req_query(req, "name");
+    HomePageData data;
+    fill_home_data(&data);
+    TplOut out = {0};
+    tpl_frag_select(&out, name != NULL ? name : "links");
+    tpl_home(&out, &data);
+    if (http_res_html(res, HTTP_STATUS_OK, &out) != 0) {
+        http_error(res, HTTP_STATUS_INTERNAL_SERVER_ERROR,
+                   "template render failed");
+    }
+    tpl_out_free(&out);
 }
 
 static void id_test_handler(const HttpRequest *req, HttpResponse *res)
@@ -341,6 +382,7 @@ int main(int argc, char **argv)
 
     /* --- Top-level routes --- */
     http_get(&server, "/", home_handler);
+    http_get(&server, "/frag", frag_handler);
 
     http_get(&server, "/:id/test", id_test_handler);
     http_get(&server, "/teapot", teapot_handler);
